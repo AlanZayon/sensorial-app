@@ -1,0 +1,45 @@
+# Android / Gradle
+android/.gradle/
+android/.kotlin/
+android/**/build/
+**/build/
+android/local.properties
+android/*.iml
+android/.idea/
+*.apk
+*.aab
+*.dex
+*.class
+*.log
+captures/
+
+# Signing (never commit keystores)
+*.jks
+*.keystore
+*.mobileprovision
+
+# iOS / Xcode
+ios/.build/
+ios/*.xcodeproj/
+ios/*.xcworkspace/
+ios/DerivedData/
+**/xcuserdata/
+*.xcuserstate
+.DS_Store
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+Thumbs.db
+.cursor/
+
+# Secrets / local config
+**/.env
+**/.env.*
+**/secrets/
+**/google-services.json
+**/GoogleService-Info.plist
+**/Secrets.xcconfig
+ios/**/Info.plist.local
+**/local.properties

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Drift curve mark for Deriva -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#5EC4B6"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:pathData="M28,62 C40,38 52,78 68,48 C76,34 82,40 86,44" />
+    <path
+        android:fillColor="#5EC4B6"
+        android:pathData="M84,40 L92,46 L84,52 Z" />
+</vector>
