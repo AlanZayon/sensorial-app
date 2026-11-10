@@ -420,17 +420,18 @@ class DiscoverySession(
             playLibraryRelative(+1)
             return
         }
-        if (!mutex.tryLock()) return
-        val prefetchTrack = try {
-            if (pendingPlayTrackId != null) return
-            val current = historyRepository.current() ?: return
+        // Wait for the mutex — tryLock used to drop natural ends while a gesture held the lock,
+        // leaving Spotify autoplay running against a stale feed UI.
+        val prefetchTrack = mutex.withLock {
+            if (pendingPlayTrackId != null) return@withLock null
+            val current = historyRepository.current() ?: return@withLock null
             if (_state.value.status != PlaybackStatus.Playing &&
                 _state.value.status != PlaybackStatus.Paused
             ) {
-                return
+                return@withLock null
             }
             // Stale end from the previous track after a fast skip.
-            if (clock.nowEpochMs() - listeningStartedAtMs < 1_500L) return
+            if (clock.nowEpochMs() - listeningStartedAtMs < 1_500L) return@withLock null
             _state.update { it.copy(status = PlaybackStatus.ChangingTrack) }
             try {
                 closeListeningLocked(
@@ -449,7 +450,7 @@ class DiscoverySession(
                             canGoForward = snapshot.canGoForward,
                         )
                     }
-                    return
+                    return@withLock null
                 }
                 historyRepository.push(next, DiscoveryMode.Normal, clock.nowEpochMs())
                 commitTrackLocked(next, lastIntentLabel = "Próxima", alreadyInHistory = true)
@@ -460,8 +461,6 @@ class DiscoverySession(
                 }
                 null
             }
-        } finally {
-            mutex.unlock()
         }
         prefetchTrack?.let { track -> playAndWarm(track) }
     }

@@ -34,7 +34,10 @@ class FeedViewModel(
             .onEach { event ->
                 when (event) {
                     is PlaybackEvent.TrackActive -> session.syncToExternalTrack(event.trackId)
-                    PlaybackEvent.TrackEnded -> session.onTrackEnded()
+                    PlaybackEvent.TrackEnded -> {
+                        // Serialize with gestures so natural advance cannot interleave mid-swipe.
+                        gestureMutex.withLock { session.onTrackEnded() }
+                    }
                     is PlaybackEvent.IsPaused -> session.onExternalPaused(event.paused)
                 }
             }

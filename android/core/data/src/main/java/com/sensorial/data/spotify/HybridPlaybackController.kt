@@ -9,6 +9,10 @@ import androidx.media3.common.Player
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import com.sensorial.domain.feed.PlaybackMode
+import com.sensorial.domain.model.Album
+import com.sensorial.domain.model.Artist
+import com.sensorial.domain.model.ArtistId
+import com.sensorial.domain.model.AudioFeatures
 import com.sensorial.domain.model.Track
 import com.sensorial.domain.model.TrackId
 import com.sensorial.domain.provider.PlaybackEvent
@@ -17,10 +21,15 @@ import com.spotify.android.appremote.api.Connector
 import com.spotify.android.appremote.api.SpotifyAppRemote
 import com.spotify.protocol.client.Subscription
 import com.spotify.protocol.types.PlayerState
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.lang.ref.WeakReference
@@ -38,6 +47,7 @@ class HybridPlaybackController(
     private var appRemote: SpotifyAppRemote? = null
     private var exoPlayer: ExoPlayer? = null
     private var playerStateSubscription: Subscription<PlayerState>? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     @Volatile
     var mode: PlaybackMode = PlaybackMode.None
@@ -48,7 +58,7 @@ class HybridPlaybackController(
         private set
 
     private val trackCache = mutableMapOf<String, Track>()
-    private val _events = MutableSharedFlow<PlaybackEvent>(extraBufferCapacity = 16)
+    private val _events = MutableSharedFlow<PlaybackEvent>(extraBufferCapacity = 32)
     val events: SharedFlow<PlaybackEvent> = _events.asSharedFlow()
 
     @Volatile
@@ -67,6 +77,13 @@ class HybridPlaybackController(
     @Volatile
     private var previewTrackId: String? = null
 
+    /** Remote end-detection: track must have actually started before we treat pause@0 as ended. */
+    @Volatile
+    private var remoteTrackWasStarted: Boolean = false
+
+    @Volatile
+    private var remoteEndedEmittedFor: String? = null
+
     fun attachHost(activity: Activity) {
         hostActivity = WeakReference(activity)
     }
@@ -82,6 +99,8 @@ class HybridPlaybackController(
     fun rememberAll(tracks: Collection<Track>) {
         tracks.forEach { remember(it) }
     }
+
+    fun cachedTrack(id: String): Track? = trackCache[id]
 
     suspend fun authorizeRemote(showAuth: Boolean = false): Result<Unit> = withContext(Dispatchers.Main) {
         val activity = hostActivity?.get()
@@ -106,13 +125,15 @@ class HybridPlaybackController(
         expectedTrackId = trackId
         // Longer window: play is fire-and-forget and Spotify can take a moment to switch.
         ignoreExternalUntilMs = System.currentTimeMillis() + 4_000L
-        // Do not pre-mark as emitted — wait for real PlayerState so DiscoverySession can confirm.
+        remoteTrackWasStarted = false
+        remoteEndedEmittedFor = null
         val track = trackCache[trackId]
         val remoteOk = tryPlayRemote(trackId, generation)
         if (generation != playGeneration) return@withContext
         if (remoteOk) {
             stopPreview()
             mode = PlaybackMode.SpotifyRemote
+            schedulePlayVerify(trackId, generation)
             return@withContext
         }
         val preview = track?.previewUrl
@@ -170,6 +191,7 @@ class HybridPlaybackController(
     }
 
     fun release() {
+        scope.cancel()
         playerStateSubscription?.cancel()
         playerStateSubscription = null
         SpotifyAppRemote.disconnect(appRemote)
@@ -192,6 +214,47 @@ class HybridPlaybackController(
                 Log.w(TAG, "App Remote play failed", error)
             }
         return true
+    }
+
+    /**
+     * Spotify autoplay often steals the next track after ours ends. Re-assert [trackId]
+     * if the player drifted away from what we requested.
+     */
+    private fun schedulePlayVerify(trackId: String, generation: Int) {
+        scope.launch {
+            delay(900L)
+            verifyExpectedPlaying(trackId, generation)
+            delay(1_600L)
+            verifyExpectedPlaying(trackId, generation)
+        }
+    }
+
+    private fun verifyExpectedPlaying(trackId: String, generation: Int) {
+        if (generation != playGeneration) return
+        if (expectedTrackId != trackId) return
+        val remote = appRemote?.takeIf { it.isConnected } ?: return
+        remote.playerApi.getPlayerState()
+            .setResultCallback { state ->
+                if (generation != playGeneration) return@setResultCallback
+                val uri = state.track?.uri ?: return@setResultCallback
+                if (!uri.startsWith("spotify:track:")) return@setResultCallback
+                val activeId = uri.removePrefix("spotify:track:")
+                if (activeId == trackId) {
+                    // Ensure UI got a confirmation even if the subscribe callback was swallowed.
+                    handlePlayerState(state, force = true)
+                    return@setResultCallback
+                }
+                Log.w(TAG, "Playback drift: active=$activeId expected=$trackId — re-issuing play")
+                expectedTrackId = trackId
+                ignoreExternalUntilMs = System.currentTimeMillis() + 4_000L
+                remote.playerApi.play("spotify:track:$trackId")
+                    .setErrorCallback { error ->
+                        Log.w(TAG, "Re-issue play failed", error)
+                    }
+            }
+            .setErrorCallback { error ->
+                Log.w(TAG, "verify getPlayerState failed", error)
+            }
     }
 
     private suspend fun connectRemote(activity: Activity?, showAuth: Boolean): SpotifyAppRemote? {
@@ -246,12 +309,14 @@ class HybridPlaybackController(
     }
 
     private fun handlePlayerState(state: PlayerState, force: Boolean = false) {
-        val uri = state.track?.uri ?: return
+        val spotifyTrack = state.track ?: return
+        val uri = spotifyTrack.uri ?: return
         if (!uri.startsWith("spotify:track:")) return
         val trackId = uri.removePrefix("spotify:track:")
         val now = System.currentTimeMillis()
         val inIgnoreWindow = now < ignoreExternalUntilMs
 
+        rememberFromPlayerState(trackId, spotifyTrack)
         _events.tryEmit(PlaybackEvent.IsPaused(state.isPaused))
 
         // While a play is in flight, drop stale PlayerState for any other track —
@@ -261,11 +326,77 @@ class HybridPlaybackController(
             return
         }
 
+        maybeEmitRemoteTrackEnded(state, trackId)
+
         if (force || trackId != lastEmittedTrackId) {
             lastEmittedTrackId = trackId
             Log.i(TAG, "External/remote track active: $trackId (force=$force)")
             _events.tryEmit(PlaybackEvent.TrackActive(TrackId(trackId)))
         }
+    }
+
+    /**
+     * App Remote has no TrackEnded callback. Detect natural end so Deriva advances
+     * before Spotify autoplay starts a random next song (main desync source).
+     */
+    private fun maybeEmitRemoteTrackEnded(state: PlayerState, trackId: String) {
+        if (mode != PlaybackMode.SpotifyRemote) return
+        // Only end-detect the track we asked to play.
+        if (expectedTrackId != null && trackId != expectedTrackId) return
+        if (remoteEndedEmittedFor == trackId) return
+
+        val duration = state.track?.duration ?: 0L
+        val position = state.playbackPosition
+
+        if (!remoteTrackWasStarted && !state.isPaused && position > 0L && duration > 0L) {
+            remoteTrackWasStarted = true
+        }
+        if (!remoteTrackWasStarted) return
+
+        // Classic SDK pattern: after playing, paused at position 0 means the track finished.
+        val classicEnd = state.isPaused && position == 0L
+        // Fire slightly early so we can play our next before Spotify autoplay steals the session.
+        val nearEnd = duration > 0L && position >= (duration - NEAR_END_MS).coerceAtLeast(0L)
+
+        if (!classicEnd && !nearEnd) return
+
+        remoteEndedEmittedFor = trackId
+        remoteTrackWasStarted = false
+        Log.i(TAG, "Remote track ended: $trackId (nearEnd=$nearEnd classic=$classicEnd pos=$position dur=$duration)")
+        _events.tryEmit(PlaybackEvent.TrackEnded)
+    }
+
+    private fun rememberFromPlayerState(trackId: String, spotifyTrack: com.spotify.protocol.types.Track) {
+        if (trackCache.containsKey(trackId)) return
+        val title = spotifyTrack.name?.takeIf { it.isNotBlank() } ?: return
+        val artistName = spotifyTrack.artist?.name?.takeIf { it.isNotBlank() }
+            ?: spotifyTrack.artists?.firstOrNull()?.name?.takeIf { it.isNotBlank() }
+            ?: "Artista"
+        val albumName = spotifyTrack.album?.name?.takeIf { it.isNotBlank() } ?: title
+        val artworkUrl = spotifyTrack.imageUri?.raw?.let { raw ->
+            when {
+                raw.startsWith("http") -> raw
+                raw.startsWith("spotify:image:") ->
+                    "https://i.scdn.co/image/${raw.removePrefix("spotify:image:")}"
+                else -> null
+            }
+        }
+        trackCache[trackId] = Track(
+            id = TrackId(trackId),
+            title = title,
+            artists = listOf(Artist(id = ArtistId("spotify-artist-$trackId"), name = artistName)),
+            album = Album(id = "spotify-album-$trackId", name = albumName, artworkUrl = artworkUrl),
+            genres = emptyList(),
+            audioFeatures = AudioFeatures(
+                energy = 0.5,
+                danceability = 0.5,
+                valence = 0.5,
+                tempo = 120.0,
+            ),
+            artworkUrl = artworkUrl,
+            durationMs = spotifyTrack.duration.takeIf { it > 0L } ?: 180_000L,
+            featureConfidence = 0.0,
+        )
     }
 
     private fun playPreview(url: String, trackId: String) {
@@ -305,5 +436,6 @@ class HybridPlaybackController(
 
     companion object {
         private const val TAG = "SensorialAppRemote"
+        private const val NEAR_END_MS = 1_400L
     }
 }

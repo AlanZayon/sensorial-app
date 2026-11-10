@@ -32,9 +32,15 @@ class SpotifyMusicProvider(
     }
 
     override suspend fun getTrack(id: TrackId): Track? {
-        val track = api.getTrack(id) ?: return null
-        playback.remember(track)
-        return track
+        val cached = playback.cachedTrack(id.value)
+        // Real catalog hits win; PlayerState stubs (confidence 0) only fill API gaps.
+        if (cached != null && cached.featureConfidence > 0.0) return cached
+        val track = runCatching { api.getTrack(id) }.getOrNull()
+        if (track != null) {
+            playback.remember(track)
+            return track
+        }
+        return cached
     }
 
     override suspend fun getTracks(ids: List<TrackId>): Map<TrackId, Track> {
