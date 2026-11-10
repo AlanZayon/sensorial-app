@@ -39,6 +39,22 @@ import kotlin.math.max
 
 private const val DoubleTapWindowMs = 280L
 
+private enum class DragAxis {
+    Undecided,
+    Horizontal,
+    Vertical,
+}
+
+/** Project drag onto a single axis so the card does not follow diagonal finger motion. */
+private fun axisLockedOffset(total: Offset, axis: DragAxis): Offset = when (axis) {
+    DragAxis.Horizontal -> Offset(total.x, 0f)
+    DragAxis.Vertical -> Offset(0f, total.y)
+    DragAxis.Undecided -> Offset.Zero
+}
+
+private fun resolveDragAxis(total: Offset): DragAxis =
+    if (abs(total.x) >= abs(total.y)) DragAxis.Horizontal else DragAxis.Vertical
+
 @Composable
 fun GestureFeedSurface(
     track: Track,
@@ -94,6 +110,7 @@ fun GestureFeedSurface(
                         totalDrag = Offset.Zero
                         var exceededDragSlop = false
                         var peakDistance = 0f
+                        var lockedAxis = DragAxis.Undecided
                         velocityTracker.resetTracking()
                         velocityTracker.addPosition(down.uptimeMillis, down.position)
 
@@ -109,19 +126,24 @@ fun GestureFeedSurface(
                                 change.consume()
                                 totalDrag += delta
                                 val distance = hypot(totalDrag.x.toDouble(), totalDrag.y.toDouble()).toFloat()
-                                peakDistance = max(peakDistance, distance)
                                 if (distance > dragSlopPx) {
                                     exceededDragSlop = true
+                                    if (lockedAxis == DragAxis.Undecided) {
+                                        lockedAxis = resolveDragAxis(totalDrag)
+                                    }
                                 }
+                                val locked = axisLockedOffset(totalDrag, lockedAxis)
+                                val lockedDistance = hypot(locked.x.toDouble(), locked.y.toDouble()).toFloat()
+                                peakDistance = max(peakDistance, lockedDistance)
                                 velocityTracker.addPosition(change.uptimeMillis, change.position)
                                 if (exceededDragSlop) {
                                     scope.launch {
-                                        offsetX.snapTo(totalDrag.x)
-                                        offsetY.snapTo(totalDrag.y)
+                                        offsetX.snapTo(locked.x)
+                                        offsetY.snapTo(locked.y)
                                     }
                                     val (nextPreview, nextProgress) = GestureMapper.previewIntent(
-                                        totalDragX = totalDrag.x,
-                                        totalDragY = totalDrag.y,
+                                        totalDragX = locked.x,
+                                        totalDragY = locked.y,
                                         startX = startX,
                                         containerWidth = widthPx,
                                         interpreter = interpreter,
@@ -169,21 +191,29 @@ fun GestureFeedSurface(
                         }
 
                         val velocity = velocityTracker.calculateVelocity()
-                        val releaseDistance = hypot(totalDrag.x.toDouble(), totalDrag.y.toDouble()).toFloat()
+                        val axis = if (lockedAxis == DragAxis.Undecided) {
+                            resolveDragAxis(totalDrag)
+                        } else {
+                            lockedAxis
+                        }
+                        val locked = axisLockedOffset(totalDrag, axis)
+                        val lockedVelocityX = if (axis == DragAxis.Horizontal) velocity.x else 0f
+                        val lockedVelocityY = if (axis == DragAxis.Vertical) velocity.y else 0f
+                        val releaseDistance = hypot(locked.x.toDouble(), locked.y.toDouble()).toFloat()
                         val abandoned = GestureMapper.shouldCancelRelease(
                             releaseDistance = releaseDistance,
                             peakDistance = peakDistance,
-                            totalDragX = totalDrag.x,
-                            totalDragY = totalDrag.y,
-                            velocityX = velocity.x,
-                            velocityY = velocity.y,
+                            totalDragX = locked.x,
+                            totalDragY = locked.y,
+                            velocityX = lockedVelocityX,
+                            velocityY = lockedVelocityY,
                             commitDistance = commitDistancePx,
                         )
                         val input = GestureMapper.toRawGestureInput(
-                            totalDragX = totalDrag.x,
-                            totalDragY = totalDrag.y,
-                            velocityX = velocity.x,
-                            velocityY = velocity.y,
+                            totalDragX = locked.x,
+                            totalDragY = locked.y,
+                            velocityX = lockedVelocityX,
+                            velocityY = lockedVelocityY,
                             startX = startX,
                             containerWidth = widthPx,
                             containerHeight = heightPx,
@@ -192,15 +222,13 @@ fun GestureFeedSurface(
                         val shouldCommit = !abandoned && interpreted !is UserIntent.Invalid
                         scope.launch {
                             if (shouldCommit) {
-                                val targetX = when {
-                                    abs(totalDrag.x) >= abs(totalDrag.y) && totalDrag.x > 0 -> exitDistance
-                                    abs(totalDrag.x) >= abs(totalDrag.y) && totalDrag.x < 0 -> -exitDistance
-                                    else -> totalDrag.x * 1.8f
+                                val targetX = when (axis) {
+                                    DragAxis.Horizontal -> if (locked.x >= 0f) exitDistance else -exitDistance
+                                    else -> 0f
                                 }
-                                val targetY = when {
-                                    abs(totalDrag.y) > abs(totalDrag.x) && totalDrag.y > 0 -> exitDistance
-                                    abs(totalDrag.y) > abs(totalDrag.x) && totalDrag.y < 0 -> -exitDistance
-                                    else -> totalDrag.y * 1.8f
+                                val targetY = when (axis) {
+                                    DragAxis.Vertical -> if (locked.y >= 0f) exitDistance else -exitDistance
+                                    else -> 0f
                                 }
                                 launch { offsetX.animateTo(targetX, tween(240)) }
                                 launch { offsetY.animateTo(targetY, tween(240)) }

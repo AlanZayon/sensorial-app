@@ -91,15 +91,17 @@ fun FeedScreen(
                     transitionSpec = {
                         (fadeIn() + scaleIn(initialScale = 0.97f)) togetherWith fadeOut()
                     },
+                    contentKey = { it.id },
                     label = "trackTransition",
                     modifier = Modifier.fillMaxSize(),
                 ) { animatedTrack ->
                     GestureFeedSurface(
                         track = animatedTrack,
                         paused = state.status.isPaused(),
+                        // Block gestures while a commit/play is in flight — overlapping
+                        // discovers were the main source of art/title vs audio desync.
                         enabled = state.status == PlaybackStatus.Playing ||
-                            state.status == PlaybackStatus.Paused ||
-                            state.status == PlaybackStatus.ChangingTrack,
+                            state.status == PlaybackStatus.Paused,
                         canGoBack = state.canGoBack,
                         canGoForward = state.canGoForward,
                         onTogglePause = onTogglePause,

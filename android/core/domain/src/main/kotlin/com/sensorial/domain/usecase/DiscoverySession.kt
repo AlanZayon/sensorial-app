@@ -14,10 +14,13 @@ import com.sensorial.domain.model.TrackId
 import com.sensorial.domain.model.TrackInteraction
 import com.sensorial.domain.preference.LikedTracks
 import com.sensorial.domain.provider.MusicProvider
+import com.sensorial.domain.preference.QuickSkip
+import com.sensorial.domain.recommendation.ContextualWeightPolicy
 import com.sensorial.domain.recommendation.DiscoveryExclusions
 import com.sensorial.domain.recommendation.RecommendationContext
 import com.sensorial.domain.recommendation.RecommendationEngine
 import com.sensorial.domain.recommendation.SessionAffinity
+import com.sensorial.domain.recommendation.WeightArm
 import com.sensorial.domain.repository.AppSettingsRepository
 import com.sensorial.domain.repository.InteractionRepository
 import com.sensorial.domain.repository.PlaybackHistoryRepository
@@ -51,6 +54,7 @@ class DiscoverySession(
     private val gestureInterpreter: GestureInterpreter = GestureInterpreter(),
     private val clock: Clock = SystemClock,
     private val idGenerator: IdGenerator = UuidIdGenerator,
+    private val weightPolicy: ContextualWeightPolicy = ContextualWeightPolicy(),
 ) {
     private val mutex = Mutex()
     private val _state = MutableStateFlow(FeedState())
@@ -58,10 +62,12 @@ class DiscoverySession(
 
     private var listeningStartedAtMs: Long = clock.nowEpochMs()
     private var prefetchedCandidates: List<Track> = emptyList()
+    private var prefetchedForMode: DiscoveryMode = DiscoveryMode.Normal
     private var lastRelatedArtistIds: Set<com.sensorial.domain.model.ArtistId> = emptySet()
     private var pendingPlayTrackId: TrackId? = null
     private val likedTrackIds = mutableSetOf<TrackId>()
     private var sessionAffinity: SessionAffinity = SessionAffinity.EMPTY
+    private var pendingWeightArm: WeightArm? = null
     /** Active liked-playlist queue; when non-empty, advance/end stay inside it. */
     private var libraryQueue: List<Track> = emptyList()
     private var libraryQueueIndex: Int = -1
@@ -228,7 +234,7 @@ class DiscoverySession(
             commitTrackLocked(next, lastIntentLabel = label, alreadyInHistory = true)
             next
         }
-        prefetchTrack?.let { track -> playAndWarm(track) }
+        prefetchTrack?.let { track -> playAndWarm(track, mode) }
     }
 
     /** Liked ids newest-first (cheap; no network). */
@@ -378,15 +384,20 @@ class DiscoverySession(
 
     suspend fun syncToExternalTrack(trackId: TrackId) {
         val prefetchTrack = mutex.withLock {
+            // Our own play request confirmed — drop the pending guard without rewriting UI.
+            if (pendingPlayTrackId == trackId) {
+                pendingPlayTrackId = null
+            }
             val current = historyRepository.current()
-            if (current?.id == trackId) return@withLock null
-            if (pendingPlayTrackId != null && pendingPlayTrackId != trackId) return@withLock null
-            if (_state.value.status == PlaybackStatus.ChangingTrack &&
-                pendingPlayTrackId != null &&
-                pendingPlayTrackId != trackId
-            ) {
+            if (current?.id == trackId) {
+                if (_state.value.status == PlaybackStatus.ChangingTrack) {
+                    publishPlaying(lastIntentLabel = _state.value.lastIntentLabel)
+                }
                 return@withLock null
             }
+            // Still waiting for a different committed play — ignore lagging PlayerState.
+            if (pendingPlayTrackId != null && pendingPlayTrackId != trackId) return@withLock null
+            if (_state.value.status == PlaybackStatus.ChangingTrack) return@withLock null
             // External player jump leaves the liked queue.
             if (libraryQueue.none { it.id == trackId }) {
                 clearLibraryQueueLocked()
@@ -418,6 +429,8 @@ class DiscoverySession(
             ) {
                 return
             }
+            // Stale end from the previous track after a fast skip.
+            if (clock.nowEpochMs() - listeningStartedAtMs < 1_500L) return
             _state.update { it.copy(status = PlaybackStatus.ChangingTrack) }
             try {
                 closeListeningLocked(
@@ -532,6 +545,7 @@ class DiscoverySession(
         preferenceRepository.save(preferenceRepository.get().applying(current, interaction))
         sessionAffinity = sessionAffinity.applying(current, interaction)
         historyRepository.updateCurrentListeningProgress(interaction.effectiveListeningProgress)
+        updateBanditLocked(current, interaction)
     }
 
     private suspend fun pickNextLocked(current: Track, mode: DiscoveryMode): Track? {
@@ -543,9 +557,15 @@ class DiscoverySession(
         val profile = preferenceRepository.get()
         val seedGenres = profile.topPositiveGenres()
         val topArtists = profile.topPositiveArtists()
-        val cached = prefetchedCandidates.filter {
-            it.id !in excluded &&
-                com.sensorial.domain.recommendation.TrackFingerprint.of(it) !in blockedFingerprints
+        val cacheUsable = prefetchedCandidates.isNotEmpty() &&
+            (prefetchedForMode == mode || mode == DiscoveryMode.Normal)
+        val cached = if (cacheUsable) {
+            prefetchedCandidates.filter {
+                it.id !in excluded &&
+                    com.sensorial.domain.recommendation.TrackFingerprint.of(it) !in blockedFingerprints
+            }
+        } else {
+            emptyList()
         }
         val fromCache = recommendFrom(
             cached, current, recent, excluded, blockedFingerprints, seedGenres, topArtists,
@@ -602,6 +622,17 @@ class DiscoverySession(
     ): Track? {
         if (candidates.isEmpty()) return null
         val interactionTracks = resolveInteractionTracks(recent, candidates, historyTracks, current)
+        val settings = settingsRepository.get()
+        val isCold = profile.positiveSignalCount + profile.negativeSignalCount == 0 &&
+            profile.genreScores.isEmpty() && profile.artistScores.isEmpty()
+        val featureConfidenceMean = candidates.map { it.featureConfidence }.average()
+        val decision = weightPolicy.select(
+            mode = mode,
+            state = settings.banditState,
+            isColdStart = isCold,
+            featureConfidenceMean = featureConfidenceMean,
+        )
+        pendingWeightArm = decision.arm
         val context = RecommendationContext(
             currentTrack = current,
             recentInteractions = recent,
@@ -616,8 +647,19 @@ class DiscoverySession(
             dayOfWeek = dayOfWeek(),
             sessionAffinity = sessionAffinity,
             blockedFingerprints = blockedFingerprints,
+            weightOverride = decision.weights,
         )
         return recommendationEngine.recommend(profile, context, candidates)
+    }
+
+    private suspend fun updateBanditLocked(track: Track, interaction: TrackInteraction) {
+        val arm = pendingWeightArm ?: return
+        val wasQuickSkip = QuickSkip.isQuickSkip(interaction, track.durationMs)
+        val reward = weightPolicy.reward(interaction, wasQuickSkip)
+        val settings = settingsRepository.get()
+        val updated = weightPolicy.update(settings.banditState, arm, reward)
+        settingsRepository.save(settings.copy(banditState = updated))
+        pendingWeightArm = null
     }
 
     private suspend fun discoveryExclusion(
@@ -660,27 +702,42 @@ class DiscoverySession(
         }
         pendingPlayTrackId = track.id
         listeningStartedAtMs = clock.nowEpochMs()
-        publishPlaying(lastIntentLabel = lastIntentLabel)
+        // Show new art/title immediately, but keep ChangingTrack until play is issued so
+        // gestures stay blocked through the Spotify handoff.
+        publishFeed(PlaybackStatus.ChangingTrack, lastIntentLabel)
     }
 
     private suspend fun playCommitted(track: Track) {
         try {
             musicProvider.playTrack(track.id)
-        } finally {
+            mutex.withLock {
+                // Only promote if this track is still the committed one.
+                if (historyRepository.current()?.id != track.id) return@withLock
+                if (pendingPlayTrackId == track.id) {
+                    pendingPlayTrackId = null
+                }
+                if (_state.value.status == PlaybackStatus.ChangingTrack) {
+                    publishPlaying(lastIntentLabel = _state.value.lastIntentLabel)
+                }
+            }
+        } catch (error: Exception) {
             mutex.withLock {
                 if (pendingPlayTrackId == track.id) {
                     pendingPlayTrackId = null
                 }
             }
+            throw error
         }
     }
 
-    private suspend fun playAndWarm(track: Track) = coroutineScope {
-        launch { playCommitted(track) }
-        launch { warmPrefetch(track) }
+    private suspend fun playAndWarm(track: Track, mode: DiscoveryMode = DiscoveryMode.Normal) = coroutineScope {
+        // Await play before returning so a newer swipe cannot start Spotify before this request
+        // has at least issued play (generation bump). Prefetch stays parallel.
+        launch { warmPrefetch(track, mode) }
+        playCommitted(track)
     }
 
-    private suspend fun warmPrefetch(current: Track) {
+    private suspend fun warmPrefetch(current: Track, mode: DiscoveryMode = DiscoveryMode.Normal) {
         val pool = runCatching {
             val profile = preferenceRepository.get()
             val recent = interactionRepository.recent(limit = 20)
@@ -692,8 +749,8 @@ class DiscoverySession(
                     excludedIds = exclusion.ids,
                     seedGenres = profile.topPositiveGenres(),
                     topArtists = profile.topPositiveArtists(),
-                    // Mode-agnostic rich pool so Deepen/Explore also hit cache.
-                    discoveryMode = DiscoveryMode.Normal,
+                    // Mode-aware prefetch so Deepen/Explore hit compatible candidates.
+                    discoveryMode = mode,
                     recentTracks = historyRepository.history.value.tracks,
                     localHour = localHour(),
                     dayOfWeek = dayOfWeek(),
@@ -707,6 +764,7 @@ class DiscoverySession(
         mutex.withLock {
             if (historyRepository.current()?.id != current.id) return
             prefetchedCandidates = pool.tracks
+            prefetchedForMode = mode
             lastRelatedArtistIds = pool.relatedArtistIds
             _state.update { it.copy(upcomingTracks = pool.tracks.take(3)) }
         }
@@ -721,13 +779,17 @@ class DiscoverySession(
         trackId != null && trackId in likedTrackIds
 
     private fun publishPlaying(lastIntentLabel: String?) {
+        publishFeed(PlaybackStatus.Playing, lastIntentLabel)
+    }
+
+    private fun publishFeed(status: PlaybackStatus, lastIntentLabel: String?) {
         val snapshot = historyRepository.history.value
         val inLibrary = libraryQueue.isNotEmpty()
         val libraryCanBack = inLibrary && libraryQueueIndex > 0
         val libraryCanForward = inLibrary && libraryQueueIndex < libraryQueue.lastIndex
         _state.update {
             FeedState(
-                status = PlaybackStatus.Playing,
+                status = status,
                 currentTrack = snapshot.currentTrack,
                 canGoBack = libraryCanBack || snapshot.canGoBack,
                 canGoForward = if (inLibrary) libraryCanForward else snapshot.canGoForward,

@@ -63,7 +63,14 @@ public extension PlaybackHistoryRepository {
 public protocol InteractionRepository: Sendable {
     func append(_ interaction: TrackInteraction) async
     func recent(limit: Int) async -> [TrackInteraction]
+    func all() async -> [TrackInteraction]
     func clear() async
+}
+
+public extension InteractionRepository {
+    func all() async -> [TrackInteraction] {
+        await recent(limit: 10_000)
+    }
 }
 
 public protocol UserPreferenceRepository: Sendable {
@@ -75,13 +82,16 @@ public protocol UserPreferenceRepository: Sendable {
 public struct AppSettings: Sendable, Equatable {
     public var historyConfig: HistoryConfig
     public var recommendationWeights: RecommendationWeights
+    public var banditState: ContextualWeightPolicyState
 
     public init(
         historyConfig: HistoryConfig = HistoryConfig(),
-        recommendationWeights: RecommendationWeights = RecommendationWeights()
+        recommendationWeights: RecommendationWeights = RecommendationWeights(),
+        banditState: ContextualWeightPolicyState = .empty
     ) {
         self.historyConfig = historyConfig
         self.recommendationWeights = recommendationWeights
+        self.banditState = banditState
     }
 }
 

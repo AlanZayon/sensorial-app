@@ -37,8 +37,10 @@ public struct SessionAffinity: Sendable, Equatable {
         var artists = artistBoosts.mapValues { $0 * ($0 < 0 ? skipAversionDecay : positiveDecay) }
             .filter { abs($0.value) >= 0.02 }
         let progress = interaction.effectiveListeningProgress
-        let isQuickSkip = progress <= 0.12 &&
-            (interaction.interactionType == .navigationAdvance || interaction.interactionType == .discovery)
+        let isQuickSkip = QuickSkip.isQuickSkip(
+            interaction: interaction,
+            trackDurationMs: track.durationMs
+        )
 
         var deepen = deepenStreak
         var explore = exploreStreak

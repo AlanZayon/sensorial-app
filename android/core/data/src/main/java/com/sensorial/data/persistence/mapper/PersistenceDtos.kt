@@ -18,7 +18,10 @@ import com.sensorial.domain.model.TrackId
 import com.sensorial.domain.model.TrackInteraction
 import com.sensorial.domain.model.VerticalIntent
 import com.sensorial.domain.preference.UserPreferenceProfile
+import com.sensorial.domain.recommendation.BanditArmStats
+import com.sensorial.domain.recommendation.ContextualWeightPolicyState
 import com.sensorial.domain.recommendation.RecommendationWeights
+import com.sensorial.domain.recommendation.WeightArm
 import com.sensorial.domain.repository.AppSettings
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -94,6 +97,19 @@ data class PreferenceProfileDto(
 data class AppSettingsDto(
     val historyMaxSize: Int = HistoryConfig.DEFAULT_MAX_SIZE,
     val weights: RecommendationWeightsDto = RecommendationWeightsDto(),
+    val bandit: BanditStateDto = BanditStateDto(),
+)
+
+@Serializable
+data class BanditArmStatsDto(
+    val pulls: Int = 0,
+    val totalReward: Double = 0.0,
+)
+
+@Serializable
+data class BanditStateDto(
+    val arms: Map<String, BanditArmStatsDto> = emptyMap(),
+    val lastArm: String? = null,
 )
 
 @Serializable
@@ -117,6 +133,9 @@ data class RecommendationWeightsDto(
     val popularityFit: Double = 0.35,
     val eraFit: Double = 0.25,
     val localSimilarity: Double = 0.4,
+    val transitionFit: Double = 0.45,
+    val deepenRelated: Double = 0.55,
+    val deepenSameArtist: Double = 0.7,
 )
 
 fun Track.toDto(): TrackDto = TrackDto(
@@ -253,6 +272,15 @@ fun AppSettings.toDto(): AppSettingsDto = AppSettingsDto(
         popularityFit = recommendationWeights.popularityFit,
         eraFit = recommendationWeights.eraFit,
         localSimilarity = recommendationWeights.localSimilarity,
+        transitionFit = recommendationWeights.transitionFit,
+        deepenRelated = recommendationWeights.deepenRelated,
+        deepenSameArtist = recommendationWeights.deepenSameArtist,
+    ),
+    bandit = BanditStateDto(
+        arms = banditState.arms.mapKeys { it.key.name }.mapValues {
+            BanditArmStatsDto(pulls = it.value.pulls, totalReward = it.value.totalReward)
+        },
+        lastArm = banditState.lastArm?.name,
     ),
 )
 
@@ -278,6 +306,16 @@ fun AppSettingsDto.toDomain(): AppSettings = AppSettings(
         popularityFit = weights.popularityFit,
         eraFit = weights.eraFit,
         localSimilarity = weights.localSimilarity,
+        transitionFit = weights.transitionFit,
+        deepenRelated = weights.deepenRelated,
+        deepenSameArtist = weights.deepenSameArtist,
+    ),
+    banditState = ContextualWeightPolicyState(
+        arms = WeightArm.entries.associateWith { arm ->
+            val dto = bandit.arms[arm.name]
+            BanditArmStats(pulls = dto?.pulls ?: 0, totalReward = dto?.totalReward ?: 0.0)
+        },
+        lastArm = bandit.lastArm?.let { runCatching { WeightArm.valueOf(it) }.getOrNull() },
     ),
 )
 

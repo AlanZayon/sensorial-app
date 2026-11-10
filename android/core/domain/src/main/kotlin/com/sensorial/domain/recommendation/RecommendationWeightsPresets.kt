@@ -17,6 +17,9 @@ object RecommendationWeightsPresets {
         localSimilarity = 0.55,
         artistGraph = 0.7,
         popularityFit = 0.25,
+        transitionFit = 0.65,
+        deepenRelated = 0.7,
+        deepenSameArtist = 0.85,
     )
 
     val Discovery = RecommendationWeights(
@@ -31,6 +34,9 @@ object RecommendationWeightsPresets {
         artistGraph = 0.35,
         popularityFit = 0.55,
         trackRepetition = 1.0,
+        transitionFit = 0.25,
+        deepenRelated = 0.2,
+        deepenSameArtist = 0.4,
     )
 
     fun forMode(mode: DiscoveryMode): RecommendationWeights = when (mode) {

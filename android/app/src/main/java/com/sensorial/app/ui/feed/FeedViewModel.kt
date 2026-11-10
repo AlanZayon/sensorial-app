@@ -15,6 +15,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class FeedViewModel(
     private val session: DiscoverySession,
@@ -22,6 +24,8 @@ class FeedViewModel(
 ) : ViewModel(), DefaultLifecycleObserver {
 
     val state: StateFlow<FeedState> = session.state
+
+    private val gestureMutex = Mutex()
 
     init {
         ProcessLifecycleOwner.get().lifecycle.addObserver(this)
@@ -59,7 +63,10 @@ class FeedViewModel(
 
     fun onGestureCommitted(input: RawGestureInput) {
         viewModelScope.launch {
-            session.interpretAndHandle(input)
+            // Serialize gesture handling so rapid swipes cannot interleave discover/play.
+            gestureMutex.withLock {
+                session.interpretAndHandle(input)
+            }
         }
     }
 

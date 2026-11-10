@@ -7,6 +7,7 @@ import com.sensorial.domain.model.DiscoveryMode
 import com.sensorial.domain.model.Track
 import com.sensorial.domain.model.TrackInteraction
 import com.sensorial.domain.preference.UserPreferenceProfile
+import com.sensorial.domain.recommendation.ContextualWeightPolicyState
 import com.sensorial.domain.recommendation.RecommendationWeights
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
@@ -55,6 +56,7 @@ interface UserPreferenceRepository {
 data class AppSettings(
     val historyConfig: HistoryConfig = HistoryConfig(),
     val recommendationWeights: RecommendationWeights = RecommendationWeights(),
+    val banditState: ContextualWeightPolicyState = ContextualWeightPolicyState.EMPTY,
 )
 
 interface AppSettingsRepository {

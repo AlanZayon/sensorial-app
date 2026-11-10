@@ -13,9 +13,12 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 
 /**
- * Mode-aware candidate pool with two latency profiles:
+ * Mode-aware candidate pool with explicit retrieval arms:
+ * - profileTopArtists / relatedGraph / seedGenreExplore / eraYearWindow / currentAlbumNeighbors
+ *
+ * Profiles:
  * - [FetchProfile.Interactive]: critical swipe path — early exit once enough quality tracks exist
- * - [FetchProfile.Prefetch]: background warm — richer union pool so Deepen/Explore hit cache
+ * - [FetchProfile.Prefetch]: background warm — richer union pool for the active discovery mode
  */
 class CandidateQueryBuilder(
     private val api: SpotifyWebApi,
@@ -25,7 +28,7 @@ class CandidateQueryBuilder(
     enum class FetchProfile {
         /** Swipe miss: prioritize time-to-first-rankable-pool. */
         Interactive,
-        /** Background: broader pool shared by all discovery modes. */
+        /** Background: broader pool for the request's discovery mode. */
         Prefetch,
     }
 
@@ -49,6 +52,7 @@ class CandidateQueryBuilder(
             config = diversity,
         ) + context.blockedFingerprints
         val relatedIds = linkedSetOf<ArtistId>()
+        val secondOrderRelated = linkedSetOf<ArtistId>()
 
         fun addAll(tracks: List<Track>) {
             for (track in tracks) {
@@ -70,11 +74,16 @@ class CandidateQueryBuilder(
             FetchProfile.Prefetch -> 48
         }
         val relatedTopLimit = when {
+            context.discoveryMode == DiscoveryMode.Explore -> if (profile == FetchProfile.Prefetch) 8 else 5
             context.discoveryMode == DiscoveryMode.Deepen -> 6
             profile == FetchProfile.Interactive -> 3
             else -> 4
         }
-        val seedArtistLimit = if (profile == FetchProfile.Interactive) 2 else 3
+        val seedArtistLimit = when {
+            context.discoveryMode == DiscoveryMode.Explore -> if (profile == FetchProfile.Prefetch) 4 else 3
+            profile == FetchProfile.Interactive -> 2
+            else -> 3
+        }
         val includeAlbums = profile == FetchProfile.Prefetch ||
             context.discoveryMode == DiscoveryMode.Deepen
         // Deepen should deepen the climate via related artists, not catalog-dump one artist.
@@ -86,8 +95,14 @@ class CandidateQueryBuilder(
 
         val current = context.currentTrack
         val genres = context.seedGenres.ifEmpty { DEFAULT_SEED_GENRES }
+        val exploreGenres = if (context.discoveryMode == DiscoveryMode.Explore) {
+            (genres + EXPLORE_SEED_GENRES).distinctBy { it.value }.take(5)
+        } else {
+            genres
+        }
         val seedArtists = context.topArtists.take(seedArtistLimit)
         val currentArtistId = current?.primaryArtist?.id?.value
+        val eraQuery = eraYearWindow(context)
 
         // Wave 1 — independent lookups in parallel (no related dependency).
         val artistTop = async {
@@ -107,9 +122,13 @@ class CandidateQueryBuilder(
                 api.searchTracks("artist:\"$name\"", limit = sameArtistSearchLimit)
             }.getOrDefault(emptyList())
         }
-        val genreJobs = genres.map { genre ->
+        val genreJobs = exploreGenres.map { genre ->
             async {
-                val limit = if (profile == FetchProfile.Interactive) 12 else 15
+                val limit = when {
+                    context.discoveryMode == DiscoveryMode.Explore -> if (profile == FetchProfile.Prefetch) 18 else 14
+                    profile == FetchProfile.Interactive -> 12
+                    else -> 15
+                }
                 runCatching { api.searchTracks("genre:\"${genre.value}\"", limit = limit) }
                     .getOrDefault(emptyList())
             }
@@ -130,19 +149,25 @@ class CandidateQueryBuilder(
             }
             runCatching { api.searchTracks("genre:\"$g\"", limit = 15) }.getOrDefault(emptyList())
         }
+        val eraJob = async {
+            if (eraQuery == null) emptyList()
+            else runCatching { api.searchTracks(eraQuery, limit = 12) }.getOrDefault(emptyList())
+        }
 
         addAll(artistTop.await())
         addAll(artistSearch.await())
         genreJobs.awaitAll().forEach(::addAll)
         seedTopJobs.awaitAll().forEach(::addAll)
         addAll(currentGenreJob.await())
+        addAll(eraJob.await())
 
         val related = relatedJob.await()
         related.forEach { relatedIds += it.id }
 
-        // Wave 2 — related artist tops (always for Deepen; otherwise if thin/prefetch).
+        // Wave 2 — related artist tops (always for Deepen/Explore; otherwise if thin/prefetch).
         if (!readyEnough(minReady) || profile == FetchProfile.Prefetch ||
-            context.discoveryMode == DiscoveryMode.Deepen
+            context.discoveryMode == DiscoveryMode.Deepen ||
+            context.discoveryMode == DiscoveryMode.Explore
         ) {
             val relatedTops = related.take(relatedTopLimit).map { artist ->
                 async {
@@ -153,9 +178,29 @@ class CandidateQueryBuilder(
             relatedTops.awaitAll().forEach(::addAll)
         }
 
-        // Wave 3 — albums only when needed (expensive multi-hop).
-        if (includeAlbums && !currentArtistId.isNullOrBlank() &&
+        // Explore: second-order related graph for novelty.
+        if (context.discoveryMode == DiscoveryMode.Explore &&
             (profile == FetchProfile.Prefetch || !readyEnough(minReady))
+        ) {
+            val hubs = related.take(3)
+            val second = hubs.map { artist ->
+                async {
+                    runCatching { api.relatedArtists(artist.id.value) }.getOrDefault(emptyList())
+                }
+            }.awaitAll().flatten()
+            second.forEach { secondOrderRelated += it.id }
+            relatedIds += secondOrderRelated
+            second.take(5).map { artist ->
+                async {
+                    runCatching { api.artistTopTracks(artist.id.value) }.getOrDefault(emptyList()).take(3)
+                }
+            }.awaitAll().forEach(::addAll)
+        }
+
+        // Wave 3 — albums only when needed (expensive multi-hop) — currentAlbumNeighbors.
+        if (includeAlbums && !currentArtistId.isNullOrBlank() &&
+            (profile == FetchProfile.Prefetch || !readyEnough(minReady) ||
+                context.discoveryMode == DiscoveryMode.Deepen)
         ) {
             addAll(
                 runCatching { api.artistRecentAlbumTracks(currentArtistId, albumLimit = 1) }
@@ -174,9 +219,32 @@ class CandidateQueryBuilder(
         }
 
         val tracks = collected.values
-            .sortedByDescending { !it.previewUrl.isNullOrBlank() }
+            .sortedWith(
+                compareByDescending<Track> { !it.previewUrl.isNullOrBlank() }
+                    .thenByDescending {
+                        // Prefer real audio-features once the pool is large enough.
+                        if (collected.size >= minReady) it.featureConfidence else 0.0
+                    }
+                    .thenByDescending { it.popularity },
+            )
             .take(targetPoolSize)
         FetchResult(tracks = tracks, relatedArtistIds = relatedIds)
+    }
+
+    private fun eraYearWindow(context: RecommendationContext): String? {
+        val years = context.recentTracks.mapNotNull { it.releaseYear }
+        if (years.isEmpty()) {
+            return if (context.discoveryMode == DiscoveryMode.Explore) "year:2015-2025" else null
+        }
+        val mean = years.average().toInt()
+        val span = when (context.discoveryMode) {
+            DiscoveryMode.Deepen -> 4
+            DiscoveryMode.Explore -> 12
+            DiscoveryMode.Normal -> 7
+        }
+        val start = (mean - span).coerceAtLeast(1950)
+        val end = (mean + span).coerceAtMost(2030)
+        return "year:$start-$end"
     }
 
     companion object {
@@ -184,6 +252,11 @@ class CandidateQueryBuilder(
             GenreId("pop"),
             GenreId("indie"),
             GenreId("electronic"),
+        )
+        val EXPLORE_SEED_GENRES = listOf(
+            GenreId("alternative"),
+            GenreId("experimental"),
+            GenreId("world"),
         )
         val FALLBACK_QUERIES = listOf(
             "year:2020-2025",

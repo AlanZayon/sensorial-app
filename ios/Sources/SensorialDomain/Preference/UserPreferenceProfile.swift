@@ -19,6 +19,7 @@ public struct PreferenceUpdateConfig: Sendable {
     public var listeningArtistDelta: Double = 0.15
     public var contextualGenreDelta: Double = 0.15
     public var quickSkipProgress: Double = 0.12
+    public var quickSkipMinMs: Int64 = 8_000
     public var quickSkipListenScale: Double = 0.9
     public var quickSkipProfileScale: Double = 0.4
     public var minBucketSamplesForContext: Int = 3
@@ -180,9 +181,11 @@ public struct UserPreferenceProfile: Sendable, Equatable {
     ) -> UserPreferenceProfile {
         var copy = self
         let progress = interaction.effectiveListeningProgress
-        let isQuickSkip = progress <= config.quickSkipProgress &&
-            interaction.interactionType != .navigationReturn &&
-            (interaction.interactionType == .navigationAdvance || interaction.interactionType == .discovery)
+        let isQuickSkip = QuickSkip.isQuickSkip(
+            interaction: interaction,
+            trackDurationMs: track.durationMs,
+            config: config
+        )
 
         if isQuickSkip {
             copy.genreListeningScores = bump(

@@ -47,6 +47,17 @@ struct PreferenceProfileDTO: Codable, Equatable {
 struct AppSettingsDTO: Codable, Equatable {
     var historyMaxSize: Int
     var weights: RecommendationWeightsDTO
+    var bandit: BanditStateDTO?
+}
+
+struct BanditArmStatsDTO: Codable, Equatable {
+    var pulls: Int
+    var totalReward: Double
+}
+
+struct BanditStateDTO: Codable, Equatable {
+    var arms: [String: BanditArmStatsDTO]
+    var lastArm: String?
 }
 
 struct RecommendationWeightsDTO: Codable, Equatable {
@@ -56,8 +67,22 @@ struct RecommendationWeightsDTO: Codable, Equatable {
     var recentSignals: Double
     var exploration: Double
     var listening: Double
+    var listeningBehavior: Double?
+    var contextualTime: Double?
+    var similarity: Double?
+    var artistDiversity: Double?
+    var trackRepetition: Double?
+    var artistFocusRelief: Double?
     var negativePenalty: Double
     var coldStart: Double
+    var sessionAffinity: Double?
+    var artistGraph: Double?
+    var popularityFit: Double?
+    var eraFit: Double?
+    var localSimilarity: Double?
+    var transitionFit: Double?
+    var deepenRelated: Double?
+    var deepenSameArtist: Double?
 }
 
 struct HistoryEntryDTO: Codable, Equatable {
@@ -232,8 +257,28 @@ extension AppSettings {
                 recentSignals: recommendationWeights.recentSignals,
                 exploration: recommendationWeights.exploration,
                 listening: recommendationWeights.listening,
+                listeningBehavior: recommendationWeights.listeningBehavior,
+                contextualTime: recommendationWeights.contextualTime,
+                similarity: recommendationWeights.similarity,
+                artistDiversity: recommendationWeights.artistDiversity,
+                trackRepetition: recommendationWeights.trackRepetition,
+                artistFocusRelief: recommendationWeights.artistFocusRelief,
                 negativePenalty: recommendationWeights.negativePenalty,
-                coldStart: recommendationWeights.coldStart
+                coldStart: recommendationWeights.coldStart,
+                sessionAffinity: recommendationWeights.sessionAffinity,
+                artistGraph: recommendationWeights.artistGraph,
+                popularityFit: recommendationWeights.popularityFit,
+                eraFit: recommendationWeights.eraFit,
+                localSimilarity: recommendationWeights.localSimilarity,
+                transitionFit: recommendationWeights.transitionFit,
+                deepenRelated: recommendationWeights.deepenRelated,
+                deepenSameArtist: recommendationWeights.deepenSameArtist
+            ),
+            bandit: BanditStateDTO(
+                arms: Dictionary(uniqueKeysWithValues: banditState.arms.map {
+                    ($0.key.rawValue, BanditArmStatsDTO(pulls: $0.value.pulls, totalReward: $0.value.totalReward))
+                }),
+                lastArm: banditState.lastArm?.rawValue
             )
         )
     }
@@ -241,7 +286,13 @@ extension AppSettings {
 
 extension AppSettingsDTO {
     func toDomain() -> AppSettings {
-        AppSettings(
+        let armMap: [WeightArm: BanditArmStats] = Dictionary(
+            uniqueKeysWithValues: WeightArm.allCases.map { arm in
+                let dto = bandit?.arms[arm.rawValue]
+                return (arm, BanditArmStats(pulls: dto?.pulls ?? 0, totalReward: dto?.totalReward ?? 0))
+            }
+        )
+        return AppSettings(
             historyConfig: HistoryConfig(maxSize: historyMaxSize),
             recommendationWeights: RecommendationWeights(
                 genre: weights.genre,
@@ -250,8 +301,26 @@ extension AppSettingsDTO {
                 recentSignals: weights.recentSignals,
                 exploration: weights.exploration,
                 listening: weights.listening,
+                listeningBehavior: weights.listeningBehavior ?? 0.55,
+                contextualTime: weights.contextualTime ?? 0.35,
+                similarity: weights.similarity ?? 0.5,
+                artistDiversity: weights.artistDiversity ?? 0.7,
+                trackRepetition: weights.trackRepetition ?? 0.85,
+                artistFocusRelief: weights.artistFocusRelief ?? 1.0,
                 negativePenalty: weights.negativePenalty,
-                coldStart: weights.coldStart
+                coldStart: weights.coldStart,
+                sessionAffinity: weights.sessionAffinity ?? 0.45,
+                artistGraph: weights.artistGraph ?? 0.5,
+                popularityFit: weights.popularityFit ?? 0.35,
+                eraFit: weights.eraFit ?? 0.25,
+                localSimilarity: weights.localSimilarity ?? 0.4,
+                transitionFit: weights.transitionFit ?? 0.45,
+                deepenRelated: weights.deepenRelated ?? 0.55,
+                deepenSameArtist: weights.deepenSameArtist ?? 0.7
+            ),
+            banditState: ContextualWeightPolicyState(
+                arms: armMap,
+                lastArm: bandit?.lastArm.flatMap(WeightArm.init(rawValue:))
             )
         )
     }

@@ -15,6 +15,14 @@ public struct RecommendationWeights: Sendable, Equatable {
     public var artistFocusRelief: Double
     public var negativePenalty: Double
     public var coldStart: Double
+    public var sessionAffinity: Double
+    public var artistGraph: Double
+    public var popularityFit: Double
+    public var eraFit: Double
+    public var localSimilarity: Double
+    public var transitionFit: Double
+    public var deepenRelated: Double
+    public var deepenSameArtist: Double
 
     public init(
         genre: Double = 1.0,
@@ -22,7 +30,7 @@ public struct RecommendationWeights: Sendable, Equatable {
         features: Double = 0.6,
         recentSignals: Double = 0.5,
         exploration: Double = 0.7,
-        listening: Double = 0.45,
+        listening: Double = 0.0,
         listeningBehavior: Double = 0.55,
         contextualTime: Double = 0.35,
         similarity: Double = 0.5,
@@ -30,7 +38,15 @@ public struct RecommendationWeights: Sendable, Equatable {
         trackRepetition: Double = 0.85,
         artistFocusRelief: Double = 1.0,
         negativePenalty: Double = 1.0,
-        coldStart: Double = 0.08
+        coldStart: Double = 0.08,
+        sessionAffinity: Double = 0.45,
+        artistGraph: Double = 0.5,
+        popularityFit: Double = 0.35,
+        eraFit: Double = 0.25,
+        localSimilarity: Double = 0.4,
+        transitionFit: Double = 0.45,
+        deepenRelated: Double = 0.55,
+        deepenSameArtist: Double = 0.7
     ) {
         self.genre = genre
         self.artist = artist
@@ -46,6 +62,14 @@ public struct RecommendationWeights: Sendable, Equatable {
         self.artistFocusRelief = artistFocusRelief
         self.negativePenalty = negativePenalty
         self.coldStart = coldStart
+        self.sessionAffinity = sessionAffinity
+        self.artistGraph = artistGraph
+        self.popularityFit = popularityFit
+        self.eraFit = eraFit
+        self.localSimilarity = localSimilarity
+        self.transitionFit = transitionFit
+        self.deepenRelated = deepenRelated
+        self.deepenSameArtist = deepenSameArtist
     }
 }
 
@@ -67,6 +91,9 @@ public struct SignalScoringConfig: Sendable, Equatable {
     public var coldStartCenterDance: Double = 0.5
     public var deepenSimilarityBoost: Double = 0.45
     public var exploreNoveltyBoost: Double = 0.45
+    public var transitionWindow: Int = 5
+    public var quickSkipProgress: Double = 0.12
+    public var quickSkipMinMs: Int64 = 8_000
 
     public init() {}
 }
@@ -84,8 +111,9 @@ public struct RecommendationContext: Sendable {
     public let localHour: Int
     public let dayOfWeek: Int
     public let sessionAffinity: SessionAffinity
-    /// Background warm uses a richer pool; swipe miss uses a faster interactive path.
     public let prefetch: Bool
+    public let blockedFingerprints: Set<String>
+    public let weightOverride: RecommendationWeights?
 
     public init(
         currentTrack: Track?,
@@ -100,7 +128,9 @@ public struct RecommendationContext: Sendable {
         localHour: Int = 12,
         dayOfWeek: Int = 1,
         sessionAffinity: SessionAffinity = .empty,
-        prefetch: Bool = false
+        prefetch: Bool = false,
+        blockedFingerprints: Set<String> = [],
+        weightOverride: RecommendationWeights? = nil
     ) {
         self.currentTrack = currentTrack
         self.recentInteractions = recentInteractions
@@ -115,6 +145,8 @@ public struct RecommendationContext: Sendable {
         self.dayOfWeek = dayOfWeek
         self.sessionAffinity = sessionAffinity
         self.prefetch = prefetch
+        self.blockedFingerprints = blockedFingerprints
+        self.weightOverride = weightOverride
     }
 }
 
@@ -128,11 +160,70 @@ public struct ScoreBreakdown: Sendable, Equatable {
     public let listeningBehavior: Double
     public let contextualTime: Double
     public let similarity: Double
+    public let session: Double
+    public let artistGraph: Double
+    public let popularityFit: Double
+    public let eraFit: Double
+    public let localSimilarity: Double
+    public let transitionFit: Double
     public let artistDiversity: Double
     public let trackRepetition: Double
     public let negative: Double
     public let coldStart: Double
+    public let deepenRelated: Double
+    public let deepenSameArtist: Double
+    public let diversity: Double
     public let total: Double
+
+    public init(
+        genre: Double,
+        artist: Double,
+        features: Double,
+        recent: Double,
+        exploration: Double,
+        listening: Double,
+        listeningBehavior: Double,
+        contextualTime: Double,
+        similarity: Double,
+        session: Double = 0,
+        artistGraph: Double = 0,
+        popularityFit: Double = 0,
+        eraFit: Double = 0,
+        localSimilarity: Double = 0,
+        transitionFit: Double = 0,
+        artistDiversity: Double,
+        trackRepetition: Double,
+        negative: Double,
+        coldStart: Double,
+        deepenRelated: Double = 0,
+        deepenSameArtist: Double = 0,
+        diversity: Double = 0,
+        total: Double
+    ) {
+        self.genre = genre
+        self.artist = artist
+        self.features = features
+        self.recent = recent
+        self.exploration = exploration
+        self.listening = listening
+        self.listeningBehavior = listeningBehavior
+        self.contextualTime = contextualTime
+        self.similarity = similarity
+        self.session = session
+        self.artistGraph = artistGraph
+        self.popularityFit = popularityFit
+        self.eraFit = eraFit
+        self.localSimilarity = localSimilarity
+        self.transitionFit = transitionFit
+        self.artistDiversity = artistDiversity
+        self.trackRepetition = trackRepetition
+        self.negative = negative
+        self.coldStart = coldStart
+        self.deepenRelated = deepenRelated
+        self.deepenSameArtist = deepenSameArtist
+        self.diversity = diversity
+        self.total = total
+    }
 }
 
 public struct ScoredTrack: Sendable {
@@ -154,17 +245,25 @@ public struct ScoredHeuristicRecommendationEngine: RecommendationEngine {
     private let signals: SignalScoringConfig
     private let diversity: DiversityConfig
     private let preferenceConfig: PreferenceUpdateConfig
+    private let trackSimilarity: LocalFeatureTrackSimilarity
+    private let useModePresets: Bool
+    private let useMmr: Bool
 
     public init(
         weights: RecommendationWeights = RecommendationWeights(),
         signals: SignalScoringConfig = SignalScoringConfig(),
         diversity: DiversityConfig = DiversityConfig(),
-        preferenceConfig: PreferenceUpdateConfig = PreferenceUpdateConfig()
+        preferenceConfig: PreferenceUpdateConfig = PreferenceUpdateConfig(),
+        useModePresets: Bool = false,
+        useMmr: Bool = true
     ) {
         self.weights = weights
         self.signals = signals
         self.diversity = diversity
         self.preferenceConfig = preferenceConfig
+        self.trackSimilarity = LocalFeatureTrackSimilarity()
+        self.useModePresets = useModePresets
+        self.useMmr = useMmr
     }
 
     public func recommend(
@@ -193,6 +292,7 @@ public struct ScoredHeuristicRecommendationEngine: RecommendationEngine {
             : context.recentTracks
         let eligible = candidateTracks.filter { candidate in
             if context.excludedIds.contains(candidate.id) { return false }
+            if context.blockedFingerprints.contains(TrackFingerprint.of(candidate)) { return false }
             return !RecentVersionBlock.isBlocked(
                 candidate: candidate,
                 recentTracks: recentForDiversity,
@@ -207,36 +307,76 @@ public struct ScoredHeuristicRecommendationEngine: RecommendationEngine {
             config: diversity
         )
         let focusedArtistId = context.discoveryMode == .deepen ? nil : focus.focusedArtistId
-        return eligible
-            .map { scoreDetailed(track: $0, profile: userProfile, context: context, focusedArtistId: focusedArtistId) }
+        let activeWeights = context.weightOverride
+            ?? (useModePresets ? RecommendationWeightsPresets.forMode(context.discoveryMode) : weights)
+        let relevanceRanked = eligible
+            .map {
+                scoreDetailed(
+                    track: $0,
+                    profile: userProfile,
+                    context: context,
+                    focusedArtistId: focusedArtistId,
+                    activeWeights: activeWeights
+                )
+            }
             .sorted { $0.score > $1.score }
+        guard useMmr else { return relevanceRanked }
+        var seed: [Track] = []
+        if let current = context.currentTrack { seed.append(current) }
+        seed.append(contentsOf: recentForDiversity.suffix(4))
+        var seen = Set<TrackId>()
+        seed = seed.filter { seen.insert($0.id).inserted }
+        return MmrSelector.selectSlate(
+            ranked: relevanceRanked,
+            seedSelected: seed,
+            mode: context.discoveryMode,
+            trackSimilarity: trackSimilarity
+        )
     }
 
     public func scoreDetailed(
         track: Track,
         profile: UserPreferenceProfile,
         context: RecommendationContext,
-        focusedArtistId: ArtistId? = nil
+        focusedArtistId: ArtistId? = nil,
+        activeWeights: RecommendationWeights? = nil
     ) -> ScoredTrack {
-        let genreAffinity = average(track.genres.map { profile.genreScore($0) })
-        let artistAffinity = average(track.artists.map { profile.artistScore($0.id) })
-        let featureAffinityValue = featureAffinity(preferred: profile.preferredFeatures, candidate: track.audioFeatures)
-        let recent = recentGestureSignal(candidate: track, context: context)
-        let exploration = explorationAlignment(track: track, context: context, explorationPreference: profile.explorationPreference)
-        let listeningBias = listeningEngagementBias(recent: context.recentInteractions)
-        let listeningBehavior = average(track.genres.map { profile.genreListeningScore($0) })
-            + average(track.artists.map { profile.artistListeningScore($0.id) }) * 0.5
-        let contextual = average(
-            track.genres.map {
-                profile.contextualGenreScore(
-                    $0,
-                    hour: context.localHour,
-                    dayOfWeek: context.dayOfWeek,
-                    config: preferenceConfig
-                )
-            }
+        let w = activeWeights ?? weights
+        let genreAffinity = unitSigned(average(track.genres.map { profile.genreScore($0) }))
+        let artistAffinity = unitSigned(average(track.artists.map { profile.artistScore($0.id) }))
+        let featureAffinityValue = unit01(
+            featureAffinity(preferred: profile.preferredFeatures, candidate: track.audioFeatures)
+                * min(1, max(0.25, track.featureConfidence))
         )
-        let similarity = currentSimilarity(candidate: track, current: context.currentTrack)
+        let recent = unitSigned(recentGestureSignal(candidate: track, context: context))
+        let exploration = unit01(
+            explorationAlignment(
+                track: track,
+                context: context,
+                explorationPreference: profile.explorationPreference
+            ) + context.sessionAffinity.explorationBoost * 0.5
+        )
+        let listeningBehavior = unitSigned(
+            average(track.genres.map { profile.genreListeningScore($0) })
+                + average(track.artists.map { profile.artistListeningScore($0.id) }) * 0.5
+        )
+        let contextual = unitSigned(
+            average(
+                track.genres.map {
+                    profile.contextualGenreScore(
+                        $0,
+                        hour: context.localHour,
+                        dayOfWeek: context.dayOfWeek,
+                        config: preferenceConfig
+                    )
+                }
+            )
+        )
+        let similarity = unit01(currentSimilarity(candidate: track, current: context.currentTrack))
+        let session = unitSigned(
+            average(track.genres.map { context.sessionAffinity.genreBoost($0) })
+                + average(track.artists.map { context.sessionAffinity.artistBoost($0.id) }) * 0.7
+        )
         let recentTracks = context.recentTracks.isEmpty
             ? context.recentInteractions.compactMap { context.interactionTracks[$0.trackId] }
             : context.recentTracks
@@ -250,29 +390,45 @@ public struct ScoredHeuristicRecommendationEngine: RecommendationEngine {
             track.artists.contains { $0.id == primary }
         } ?? false
         let isRelatedArtist = track.artists.contains { context.relatedArtistIds.contains($0.id) }
-        let artistPenalty = RecentArtistPenalty.score(
-            candidate: track,
-            recentTracks: recentTracks,
-            config: diversity,
-            focusedArtistId: focusedArtistId
+        let graph = unitSigned(artistGraphProximity(candidate: track, context: context, sameArtistStreak: sameArtistStreak))
+        let popularity = unit01(popularityFit(track: track, mode: context.discoveryMode))
+        let era = unit01(eraFit(candidate: track, recent: recentTracks))
+        let localSimRaw: Double
+        if let current = context.currentTrack {
+            localSimRaw = trackSimilarity.similarity(track, current)
+                * min(1, max(0.25, track.featureConfidence))
+        } else {
+            localSimRaw = 0
+        }
+        let localSimScale: Double
+        switch context.discoveryMode {
+        case .explore: localSimScale = 0.2
+        case .deepen: localSimScale = 1
+        case .normal: localSimScale = 0.65
+        }
+        let localSim = unit01(localSimRaw * localSimScale)
+        let transition = unit01(transitionFit(candidate: track, recentTracks: recentTracks, current: context.currentTrack))
+        let artistPenalty = unit01(
+            RecentArtistPenalty.score(
+                candidate: track,
+                recentTracks: recentTracks,
+                config: diversity,
+                focusedArtistId: focusedArtistId
+            )
         )
-        let trackPenalty = RecentTrackPenalty.score(
-            candidate: track,
-            recentTracks: recentTracks,
-            config: diversity
+        let trackPenalty = unit01(
+            RecentTrackPenalty.score(candidate: track, recentTracks: recentTracks, config: diversity)
         )
-        let negative = negativePressure(genreScore: genreAffinity, artistScore: artistAffinity)
-        let cold = profile.isColdStart ? coldStartTieBreak(track: track) : 0
+        let negative = unit01(negativePressure(genreScore: genreAffinity, artistScore: artistAffinity))
+        let cold = profile.isColdStart ? unit01(coldStartTieBreak(track: track)) : 0
 
+        let deepenExtra = Double(min(3, context.sessionAffinity.deepenStreak)) * 0.08
+        let exploreExtra = Double(min(3, context.sessionAffinity.exploreStreak)) * 0.08
         let deepenSimilarityScale: Double
         if context.discoveryMode == .deepen && sharesCurrentArtist {
-            if sameArtistStreak >= 3 {
-                deepenSimilarityScale = 0.35
-            } else if sameArtistStreak >= 2 {
-                deepenSimilarityScale = 0.55
-            } else {
-                deepenSimilarityScale = 1
-            }
+            if sameArtistStreak >= 3 { deepenSimilarityScale = 0.35 }
+            else if sameArtistStreak >= 2 { deepenSimilarityScale = 0.55 }
+            else { deepenSimilarityScale = 1 }
         } else {
             deepenSimilarityScale = 1
         }
@@ -281,53 +437,61 @@ public struct ScoredHeuristicRecommendationEngine: RecommendationEngine {
         let modeExplorationBoost: Double
         switch context.discoveryMode {
         case .deepen:
-            modeSimilarityBoost = signals.deepenSimilarityBoost * similarity * deepenSimilarityScale
+            modeSimilarityBoost = (signals.deepenSimilarityBoost + deepenExtra) * similarity * deepenSimilarityScale
             modeExplorationBoost = sameArtistStreak >= 2
                 ? 0.12 * (1 - similarity)
                 : -0.15 * (1 - similarity)
         case .explore:
             modeSimilarityBoost = -signals.exploreNoveltyBoost * similarity * 0.35
-            modeExplorationBoost = signals.exploreNoveltyBoost * (1 - similarity)
+            modeExplorationBoost = (signals.exploreNoveltyBoost + exploreExtra) * (1 - similarity)
         case .normal:
-            modeSimilarityBoost = context.sessionAffinity.explorationBoost * (1 - similarity) * 0.4
-            modeExplorationBoost = 0
+            modeSimilarityBoost = 0
+            modeExplorationBoost = context.sessionAffinity.explorationBoost * (1 - similarity) * 0.4
         }
 
-        let deepenSameArtistPenalty: Double
+        let deepenSameArtistRaw: Double
         if context.discoveryMode == .deepen && sharesCurrentArtist && sameArtistStreak >= 2 {
-            deepenSameArtistPenalty = Double(sameArtistStreak - 1) * 0.7
+            deepenSameArtistRaw = min(1, Double(sameArtistStreak - 1) * 0.35)
         } else {
-            deepenSameArtistPenalty = 0
+            deepenSameArtistRaw = 0
         }
-        let deepenRelatedBoost: Double
+        let deepenRelatedRaw: Double
         if context.discoveryMode == .deepen &&
             isRelatedArtist &&
             !sharesCurrentArtist &&
             sameArtistStreak >= 2 {
-            deepenRelatedBoost = 0.45 + Double(min(3, sameArtistStreak - 2)) * 0.18
+            deepenRelatedRaw = min(1, 0.55 + Double(min(3, sameArtistStreak - 2)) * 0.15)
         } else {
-            deepenRelatedBoost = 0
+            deepenRelatedRaw = 0
         }
 
-        let genre = weights.genre * genreAffinity
-        let artist = weights.artist * artistAffinity
-        let features = weights.features * featureAffinityValue
-        let recentWeighted = weights.recentSignals * recent
-        let explorationWeighted = weights.exploration * (exploration + modeExplorationBoost)
-        let listeningWeighted = weights.listening * listeningBias
-        let listeningBehaviorWeighted = weights.listeningBehavior * listeningBehavior
-        let contextualWeighted = weights.contextualTime * contextual
-        let similarityWeighted = weights.similarity * (similarity + modeSimilarityBoost)
-        let artistDivWeighted = weights.artistDiversity * artistPenalty
-        let trackRepWeighted = weights.trackRepetition * trackPenalty
-        let negativeWeighted = weights.negativePenalty * negative
-        let coldWeighted = weights.coldStart * cold
+        let genre = w.genre * genreAffinity
+        let artist = w.artist * artistAffinity
+        let features = w.features * featureAffinityValue
+        let recentWeighted = w.recentSignals * recent
+        let explorationWeighted = w.exploration * min(1.5, max(-1, exploration + modeExplorationBoost))
+        let listeningBehaviorWeighted = w.listeningBehavior * listeningBehavior
+        let contextualWeighted = w.contextualTime * contextual
+        let similarityWeighted = w.similarity * min(1.5, max(-1, similarity + modeSimilarityBoost))
+        let sessionWeighted = w.sessionAffinity * session
+        let graphWeighted = w.artistGraph * graph
+        let popularityWeighted = w.popularityFit * popularity
+        let eraWeighted = w.eraFit * era
+        let localSimWeighted = w.localSimilarity * localSim
+        let transitionWeighted = w.transitionFit * transition
+        let artistDivWeighted = w.artistDiversity * artistPenalty
+        let trackRepWeighted = w.trackRepetition * trackPenalty
+        let negativeWeighted = w.negativePenalty * negative
+        let coldWeighted = w.coldStart * cold
+        let deepenRelatedWeighted = w.deepenRelated * deepenRelatedRaw
+        let deepenSameArtistWeighted = w.deepenSameArtist * deepenSameArtistRaw
 
         let total = genre + artist + features + recentWeighted + explorationWeighted
-            + listeningWeighted + listeningBehaviorWeighted + contextualWeighted + similarityWeighted
-            + deepenRelatedBoost
+            + listeningBehaviorWeighted + contextualWeighted + similarityWeighted
+            + sessionWeighted + graphWeighted + popularityWeighted + eraWeighted + localSimWeighted
+            + transitionWeighted + deepenRelatedWeighted
             - artistDivWeighted - trackRepWeighted - negativeWeighted + coldWeighted
-            - deepenSameArtistPenalty
+            - deepenSameArtistWeighted
 
         return ScoredTrack(
             track: track,
@@ -338,17 +502,88 @@ public struct ScoredHeuristicRecommendationEngine: RecommendationEngine {
                 features: features,
                 recent: recentWeighted,
                 exploration: explorationWeighted,
-                listening: listeningWeighted,
+                listening: 0,
                 listeningBehavior: listeningBehaviorWeighted,
                 contextualTime: contextualWeighted,
                 similarity: similarityWeighted,
+                session: sessionWeighted,
+                artistGraph: graphWeighted,
+                popularityFit: popularityWeighted,
+                eraFit: eraWeighted,
+                localSimilarity: localSimWeighted,
+                transitionFit: transitionWeighted,
                 artistDiversity: -artistDivWeighted,
                 trackRepetition: -trackRepWeighted,
                 negative: -negativeWeighted,
                 coldStart: coldWeighted,
+                deepenRelated: deepenRelatedWeighted,
+                deepenSameArtist: -deepenSameArtistWeighted,
+                diversity: 0,
                 total: total
             )
         )
+    }
+
+    private func transitionFit(candidate: Track, recentTracks: [Track], current: Track?) -> Double {
+        var window: [Track] = []
+        if let current { window.append(current) }
+        window.append(contentsOf: recentTracks.reversed())
+        var seen = Set<TrackId>()
+        window = window.filter { seen.insert($0.id).inserted }.prefix(signals.transitionWindow).map { $0 }
+        guard !window.isEmpty else { return 0 }
+        var weighted = 0.0
+        var weightSum = 0.0
+        for (index, track) in window.enumerated() {
+            let w = 1.0 / (1.0 + Double(index))
+            weighted += w * trackAffinity(candidate, track)
+            weightSum += w
+        }
+        return weightSum == 0 ? 0 : min(1, max(0, weighted / weightSum))
+    }
+
+    private func artistGraphProximity(candidate: Track, context: RecommendationContext, sameArtistStreak: Int) -> Double {
+        guard let current = context.currentTrack else { return 0 }
+        let candidateArtists = Set(candidate.artists.map(\.id))
+        let currentArtists = Set(current.artists.map(\.id))
+        if !candidateArtists.isDisjoint(with: currentArtists) {
+            switch context.discoveryMode {
+            case .deepen:
+                if sameArtistStreak >= 3 { return 0.1 }
+                if sameArtistStreak >= 2 { return 0.35 }
+                return 0.85
+            case .explore: return -0.25
+            case .normal: return 0.15
+            }
+        }
+        if !candidateArtists.isDisjoint(with: context.relatedArtistIds) {
+            switch context.discoveryMode {
+            case .deepen: return sameArtistStreak >= 2 ? 0.95 : 0.7
+            case .explore: return 0.2
+            case .normal: return 0.45
+            }
+        }
+        if !candidateArtists.isDisjoint(with: Set(context.topArtists)) {
+            return context.discoveryMode == .explore ? 0.15 : 0.4
+        }
+        return context.discoveryMode == .explore ? 0.35 : 0
+    }
+
+    private func popularityFit(track: Track, mode: DiscoveryMode) -> Double {
+        let p = Double(min(100, max(0, track.popularity))) / 100.0
+        switch mode {
+        case .deepen: return 0.35 + 0.65 * p
+        case .explore: return 1 - abs(p - 0.4)
+        case .normal: return 0.5 + 0.3 * p
+        }
+    }
+
+    private func eraFit(candidate: Track, recent: [Track]) -> Double {
+        guard let year = candidate.releaseYear else { return 0 }
+        let recentYears = recent.compactMap(\.releaseYear)
+        guard !recentYears.isEmpty else { return 0 }
+        let mean = Double(recentYears.reduce(0, +)) / Double(recentYears.count)
+        let distance = abs(Double(year) - mean)
+        return 1 - min(1, max(0, distance / 25))
     }
 
     private func currentSimilarity(candidate: Track, current: Track?) -> Double {
@@ -366,6 +601,13 @@ public struct ScoredHeuristicRecommendationEngine: RecommendationEngine {
             let strength = signalStrength(interaction)
             let affinity = trackAffinity(candidate, interacted)
             let progress = interaction.effectiveListeningProgress
+            let duration = interaction.trackDurationMs ?? interacted.durationMs
+            let quickSkip = QuickSkip.isQuickSkip(
+                progress: progress,
+                trackDurationMs: duration,
+                baseProgress: signals.quickSkipProgress,
+                minListeningMs: signals.quickSkipMinMs
+            )
 
             switch interaction.interactionType {
             case .explicitLike:
@@ -375,7 +617,7 @@ public struct ScoredHeuristicRecommendationEngine: RecommendationEngine {
             case .explicitDislike:
                 score -= signals.negativeRecentCoeff * affinity * strength * recency
             case .navigationAdvance, .discovery:
-                if progress <= 0.12 {
+                if quickSkip {
                     score -= signals.negativeRecentCoeff * affinity * 0.85 * recency
                 } else {
                     score += (progress - 0.45) * 0.25 * affinity * recency
@@ -395,7 +637,7 @@ public struct ScoredHeuristicRecommendationEngine: RecommendationEngine {
 
             let novelty = noveltyBetween(candidate, interacted)
             let proximity = 1 - novelty
-            if progress <= 0.12 &&
+            if quickSkip &&
                 (interaction.interactionType == .navigationAdvance || interaction.interactionType == .discovery) {
                 score -= signals.similarProximityCoeff * proximity * 0.9 * recency
             }
@@ -447,12 +689,6 @@ public struct ScoredHeuristicRecommendationEngine: RecommendationEngine {
         case .normal: modeBias = explorationPreference
         }
         return modeBias * explorePull + (1 - modeBias) * similarPull
-    }
-
-    private func listeningEngagementBias(recent: [TrackInteraction]) -> Double {
-        let window = Array(recent.suffix(signals.recentWindow))
-        guard !window.isEmpty else { return 0 }
-        return average(window.map(\.effectiveListeningProgress))
     }
 
     private func signalStrength(_ interaction: TrackInteraction) -> Double {
@@ -515,6 +751,9 @@ public struct ScoredHeuristicRecommendationEngine: RecommendationEngine {
         guard !values.isEmpty else { return 0 }
         return values.reduce(0, +) / Double(values.count)
     }
+
+    private func unitSigned(_ value: Double) -> Double { min(1, max(-1, value)) }
+    private func unit01(_ value: Double) -> Double { min(1, max(0, value)) }
 }
 
 private extension UserPreferenceProfile {

@@ -30,6 +30,11 @@ data class PreferenceUpdateConfig(
     val contextualGenreDelta: Double = 0.15,
     /** Progress at/below this on advance/discovery counts as lost interest (quick skip). */
     val quickSkipProgress: Double = 0.12,
+    /**
+     * Minimum listen time used to raise the progress threshold on short tracks
+     * (duration-aware quick-skip).
+     */
+    val quickSkipMinMs: Long = 8_000L,
     /** Strength of durable listening aversion on quick skip (vs long-listen positive). */
     val quickSkipListenScale: Double = 0.9,
     /** Soft durable profile aversion on quick skip (weaker than explicit dislike). */
@@ -198,12 +203,7 @@ data class UserPreferenceProfile(
         config: PreferenceUpdateConfig = PreferenceUpdateConfig(),
     ): UserPreferenceProfile {
         val progress = interaction.effectiveListeningProgress
-        val isQuickSkip = progress <= config.quickSkipProgress &&
-            interaction.interactionType != InteractionType.NavigationReturn &&
-            interaction.interactionType in setOf(
-                InteractionType.NavigationAdvance,
-                InteractionType.Discovery,
-            )
+        val isQuickSkip = QuickSkip.isQuickSkip(interaction, track.durationMs, config)
 
         // Quick skip = lost interest: durable aversion that survives explorationBoost decay.
         if (isQuickSkip) {

@@ -18,10 +18,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.sensorial.domain.feed.PlaybackStatus
 import com.sensorial.domain.model.Track
 
@@ -32,6 +34,7 @@ fun TrackCard(
     modifier: Modifier = Modifier,
     overlay: @Composable () -> Unit = {},
 ) {
+    val context = LocalContext.current
     val artworkUrl = track.artworkUrl?.takeIf { it.isNotBlank() }
         ?: track.album.artworkUrl?.takeIf { it.isNotBlank() }
     val genre = track.genres.firstOrNull()?.value
@@ -48,7 +51,12 @@ fun TrackCard(
     ) {
         if (artworkUrl != null) {
             AsyncImage(
-                model = artworkUrl,
+                model = ImageRequest.Builder(context)
+                    .data(artworkUrl)
+                    .memoryCacheKey(track.id.value)
+                    .diskCacheKey(track.id.value)
+                    .crossfade(true)
+                    .build(),
                 contentDescription = track.album.name,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),

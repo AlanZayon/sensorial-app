@@ -14,7 +14,11 @@ public actor DiscoverySession {
     private var likedTrackIds: Set<TrackId> = []
     private var sessionAffinity: SessionAffinity = .empty
     private var prefetchedCandidates: [Track] = []
+    private var prefetchedForMode: DiscoveryMode = .normal
     private var lastRelatedArtistIds: Set<ArtistId> = []
+    private var weightPolicy = ContextualWeightPolicy()
+    private var banditState = ContextualWeightPolicyState.empty
+    private var pendingWeightArm: WeightArm?
     private var stateContinuation: AsyncStream<FeedState>.Continuation?
     public private(set) var state: FeedState = FeedState()
 
@@ -154,12 +158,35 @@ public actor DiscoverySession {
 
         let recent = await interactionRepository.recent(limit: 20)
         let snapshot = await historyRepository.snapshot()
-        let excluded = Set(snapshot.tracks.map(\.id))
+        let interactions = await interactionRepository.all()
+        let heardIds = DiscoveryExclusions.wellHeardIds(
+            interactions: interactions,
+            historyEntries: snapshot.entries
+        )
+        let excluded = DiscoveryExclusions.ids(
+            likedIds: likedTrackIds,
+            interactions: interactions,
+            historyEntries: snapshot.entries,
+            extra: [current.id]
+        )
+        let knownTracks = snapshot.tracks + [current]
+        let blockedFingerprints = DiscoveryExclusions.fingerprints(
+            knownTracks: knownTracks,
+            likedIds: likedTrackIds,
+            heardIds: heardIds
+        )
         let profile = await preferenceRepository.get()
         do {
             let seedGenres = profile.topPositiveGenres()
             let topArtists = profile.topPositiveArtists()
-            let cached = prefetchedCandidates.filter { !excluded.contains($0.id) }
+            let cacheUsable = !prefetchedCandidates.isEmpty &&
+                (prefetchedForMode == mode || mode == .normal)
+            let cached = cacheUsable
+                ? prefetchedCandidates.filter {
+                    !excluded.contains($0.id) &&
+                        !blockedFingerprints.contains(TrackFingerprint.of($0))
+                }
+                : []
             var relatedIds = lastRelatedArtistIds
             var candidates = cached
 
@@ -171,17 +198,19 @@ public actor DiscoverySession {
                     historyTracks: snapshot.tracks,
                     current: current
                 )
-                let context = RecommendationContext(
-                    currentTrack: current,
-                    recentInteractions: recent,
-                    excludedIds: excluded,
+                let context = makeRankingContext(
+                    current: current,
+                    recent: recent,
+                    excluded: excluded,
+                    blockedFingerprints: blockedFingerprints,
                     interactionTracks: interactionTracks,
                     seedGenres: seedGenres,
                     topArtists: topArtists,
-                    relatedArtistIds: relatedIds,
-                    discoveryMode: mode,
-                    recentTracks: snapshot.tracks,
-                    sessionAffinity: sessionAffinity
+                    relatedIds: relatedIds,
+                    mode: mode,
+                    historyTracks: snapshot.tracks,
+                    profile: profile,
+                    candidates: cached
                 )
                 if let cachedPick = recommendationEngine.recommend(
                     userProfile: profile,
@@ -203,7 +232,8 @@ public actor DiscoverySession {
                     discoveryMode: mode,
                     recentTracks: snapshot.tracks,
                     sessionAffinity: sessionAffinity,
-                    prefetch: false
+                    prefetch: false,
+                    blockedFingerprints: blockedFingerprints
                 )
                 let pool = try await musicProvider.getCandidatePool(context: draft)
                 candidates = pool.tracks
@@ -215,17 +245,19 @@ public actor DiscoverySession {
                     historyTracks: snapshot.tracks,
                     current: current
                 )
-                let context = RecommendationContext(
-                    currentTrack: current,
-                    recentInteractions: recent,
-                    excludedIds: excluded,
+                let context = makeRankingContext(
+                    current: current,
+                    recent: recent,
+                    excluded: excluded,
+                    blockedFingerprints: blockedFingerprints,
                     interactionTracks: interactionTracks,
                     seedGenres: seedGenres,
                     topArtists: topArtists,
-                    relatedArtistIds: relatedIds,
-                    discoveryMode: mode,
-                    recentTracks: snapshot.tracks,
-                    sessionAffinity: sessionAffinity
+                    relatedIds: relatedIds,
+                    mode: mode,
+                    historyTracks: snapshot.tracks,
+                    profile: profile,
+                    candidates: candidates
                 )
                 guard let picked = recommendationEngine.recommend(
                     userProfile: profile,
@@ -253,13 +285,55 @@ public actor DiscoverySession {
                 discoveryMode: mode,
                 recommendedAtEpochMs: nowEpochMs()
             )
-            Task { await self.warmPrefetch(current: next) }
+            Task { await self.warmPrefetch(current: next, mode: mode) }
             try await musicProvider.playTrack(id: next.id)
             listeningStartedAtMs = nowEpochMs()
             await publishPlaying(lastIntentLabel: intentLabel)
         } catch {
             publish(FeedState(status: .error, errorMessage: error.localizedDescription))
         }
+    }
+
+    private func makeRankingContext(
+        current: Track,
+        recent: [TrackInteraction],
+        excluded: Set<TrackId>,
+        blockedFingerprints: Set<String>,
+        interactionTracks: [TrackId: Track],
+        seedGenres: [GenreId],
+        topArtists: [ArtistId],
+        relatedIds: Set<ArtistId>,
+        mode: DiscoveryMode,
+        historyTracks: [Track],
+        profile: UserPreferenceProfile,
+        candidates: [Track]
+    ) -> RecommendationContext {
+        let isCold = profile.positiveSignalCount + profile.negativeSignalCount == 0
+            && profile.genreScores.isEmpty && profile.artistScores.isEmpty
+        let featureMean = candidates.isEmpty
+            ? 1.0
+            : candidates.map(\.featureConfidence).reduce(0, +) / Double(candidates.count)
+        let decision = weightPolicy.select(
+            mode: mode,
+            state: banditState,
+            isColdStart: isCold,
+            featureConfidenceMean: featureMean
+        )
+        pendingWeightArm = decision.arm
+        return RecommendationContext(
+            currentTrack: current,
+            recentInteractions: recent,
+            excludedIds: excluded,
+            interactionTracks: interactionTracks,
+            seedGenres: seedGenres,
+            topArtists: topArtists,
+            relatedArtistIds: relatedIds,
+            discoveryMode: mode,
+            recentTracks: historyTracks,
+            sessionAffinity: sessionAffinity,
+            blockedFingerprints: blockedFingerprints,
+            weightOverride: decision.weights
+        )
     }
 
     /// Toggle explicit like — second tap undoes preference impact.
@@ -352,6 +426,12 @@ public actor DiscoverySession {
         let updated = await preferenceRepository.get().applying(track: current, interaction: interaction)
         await preferenceRepository.save(updated)
         sessionAffinity = sessionAffinity.applying(track: current, interaction: interaction)
+        if let arm = pendingWeightArm {
+            let wasQuickSkip = QuickSkip.isQuickSkip(interaction: interaction, trackDurationMs: current.durationMs)
+            let reward = weightPolicy.reward(interaction: interaction, wasQuickSkip: wasQuickSkip)
+            banditState = weightPolicy.update(state: banditState, arm: arm, reward: reward)
+            pendingWeightArm = nil
+        }
     }
 
     private func buildInteraction(
@@ -426,13 +506,27 @@ public actor DiscoverySession {
         stateContinuation?.yield(newState)
     }
 
-    private func warmPrefetch(current: Track) async {
+    private func warmPrefetch(current: Track, mode: DiscoveryMode = .normal) async {
         do {
             let profile = await preferenceRepository.get()
             let recent = await interactionRepository.recent(limit: 20)
             let snapshot = await historyRepository.snapshot()
-            var excluded = Set(snapshot.tracks.map(\.id))
-            excluded.insert(current.id)
+            let interactions = await interactionRepository.all()
+            let heardIds = DiscoveryExclusions.wellHeardIds(
+                interactions: interactions,
+                historyEntries: snapshot.entries
+            )
+            let excluded = DiscoveryExclusions.ids(
+                likedIds: likedTrackIds,
+                interactions: interactions,
+                historyEntries: snapshot.entries,
+                extra: [current.id]
+            )
+            let blockedFingerprints = DiscoveryExclusions.fingerprints(
+                knownTracks: snapshot.tracks + [current],
+                likedIds: likedTrackIds,
+                heardIds: heardIds
+            )
             let pool = try await musicProvider.getCandidatePool(
                 context: RecommendationContext(
                     currentTrack: current,
@@ -440,14 +534,16 @@ public actor DiscoverySession {
                     excludedIds: excluded,
                     seedGenres: profile.topPositiveGenres(),
                     topArtists: profile.topPositiveArtists(),
-                    discoveryMode: .normal,
+                    discoveryMode: mode,
                     recentTracks: snapshot.tracks,
                     sessionAffinity: sessionAffinity,
-                    prefetch: true
+                    prefetch: true,
+                    blockedFingerprints: blockedFingerprints
                 )
             )
             guard await historyRepository.current()?.id == current.id else { return }
             prefetchedCandidates = pool.tracks
+            prefetchedForMode = mode
             lastRelatedArtistIds = pool.relatedArtistIds
         } catch {
             // Prefetch is best-effort.

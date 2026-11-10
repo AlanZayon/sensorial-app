@@ -60,6 +60,13 @@ class HybridPlaybackController(
     @Volatile
     private var lastEmittedTrackId: String? = null
 
+    /** Bumped on every [play] so a slow App Remote connect cannot overwrite a newer request. */
+    @Volatile
+    private var playGeneration: Int = 0
+
+    @Volatile
+    private var previewTrackId: String? = null
+
     fun attachHost(activity: Activity) {
         hostActivity = WeakReference(activity)
     }
@@ -95,12 +102,14 @@ class HybridPlaybackController(
     }
 
     suspend fun play(trackId: String) = withContext(Dispatchers.Main) {
+        val generation = ++playGeneration
         expectedTrackId = trackId
         // Longer window: play is fire-and-forget and Spotify can take a moment to switch.
         ignoreExternalUntilMs = System.currentTimeMillis() + 4_000L
-        lastEmittedTrackId = trackId
+        // Do not pre-mark as emitted — wait for real PlayerState so DiscoverySession can confirm.
         val track = trackCache[trackId]
-        val remoteOk = tryPlayRemote(trackId)
+        val remoteOk = tryPlayRemote(trackId, generation)
+        if (generation != playGeneration) return@withContext
         if (remoteOk) {
             stopPreview()
             mode = PlaybackMode.SpotifyRemote
@@ -108,7 +117,7 @@ class HybridPlaybackController(
         }
         val preview = track?.previewUrl
         if (!preview.isNullOrBlank()) {
-            playPreview(preview)
+            playPreview(preview, trackId)
             mode = PlaybackMode.Preview
         } else {
             mode = PlaybackMode.None
@@ -170,11 +179,12 @@ class HybridPlaybackController(
         mode = PlaybackMode.None
     }
 
-    private suspend fun tryPlayRemote(trackId: String): Boolean {
+    private suspend fun tryPlayRemote(trackId: String, generation: Int): Boolean {
         val activity = hostActivity?.get()
         val remote = appRemote?.takeIf { it.isConnected }
             ?: connectRemote(activity, showAuth = false)
             ?: return false
+        if (generation != playGeneration) return false
         // Fire-and-forget: waiting for Spotify's ack made every swipe feel stuck.
         remote.playerApi.play("spotify:track:$trackId")
             .setErrorCallback { error ->
@@ -240,29 +250,35 @@ class HybridPlaybackController(
         if (!uri.startsWith("spotify:track:")) return
         val trackId = uri.removePrefix("spotify:track:")
         val now = System.currentTimeMillis()
-        val inIgnoreWindow = !force && now < ignoreExternalUntilMs
+        val inIgnoreWindow = now < ignoreExternalUntilMs
 
         _events.tryEmit(PlaybackEvent.IsPaused(state.isPaused))
 
+        // While a play is in flight, drop stale PlayerState for any other track —
+        // including force reconcile, which otherwise rewrites the feed to the old song.
+        if (inIgnoreWindow && trackId != expectedTrackId) {
+            Log.d(TAG, "Ignoring stale player track $trackId (expected $expectedTrackId, force=$force)")
+            return
+        }
+
         if (force || trackId != lastEmittedTrackId) {
-            if (inIgnoreWindow && trackId == expectedTrackId) {
-                lastEmittedTrackId = trackId
-                return
-            }
             lastEmittedTrackId = trackId
             Log.i(TAG, "External/remote track active: $trackId (force=$force)")
             _events.tryEmit(PlaybackEvent.TrackActive(TrackId(trackId)))
         }
     }
 
-    private fun playPreview(url: String) {
+    private fun playPreview(url: String, trackId: String) {
         val player = exoPlayer ?: ExoPlayer.Builder(appContext).build().also { exo ->
             exoPlayer = exo
             exo.addListener(
                 object : Player.Listener {
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         if (playbackState == Player.STATE_ENDED) {
-                            _events.tryEmit(PlaybackEvent.TrackEnded)
+                            // Ignore end events from a preview that was already superseded.
+                            if (previewTrackId != null && previewTrackId == expectedTrackId) {
+                                _events.tryEmit(PlaybackEvent.TrackEnded)
+                            }
                         }
                     }
 
@@ -272,12 +288,18 @@ class HybridPlaybackController(
                 },
             )
         }
+        previewTrackId = trackId
+        if (trackId != lastEmittedTrackId) {
+            lastEmittedTrackId = trackId
+            _events.tryEmit(PlaybackEvent.TrackActive(TrackId(trackId)))
+        }
         player.setMediaItem(MediaItem.fromUri(Uri.parse(url)))
         player.prepare()
         player.play()
     }
 
     private fun stopPreview() {
+        previewTrackId = null
         exoPlayer?.stop()
     }
 

@@ -31,12 +31,14 @@ data class SessionAffinity(
         // Keep negative (skip) aversions around longer than temporary positive boosts.
         val decayedGenres = decayMixed(genreBoosts, config.decay, config.skipAversionDecay)
         val decayedArtists = decayMixed(artistBoosts, config.decay, config.skipAversionDecay)
-        val progress = interaction.effectiveListeningProgress
-        val isQuickSkip = progress <= config.quickSkipProgress &&
-            interaction.interactionType in setOf(
-                InteractionType.NavigationAdvance,
-                InteractionType.Discovery,
-            )
+        val isQuickSkip = com.sensorial.domain.preference.QuickSkip.isQuickSkip(
+            interaction = interaction,
+            trackDurationMs = track.durationMs,
+            config = com.sensorial.domain.preference.PreferenceUpdateConfig(
+                quickSkipProgress = config.quickSkipProgress,
+                quickSkipMinMs = config.quickSkipMinMs,
+            ),
+        )
 
         var deepen = deepenStreak
         var explore = exploreStreak
@@ -59,7 +61,7 @@ data class SessionAffinity(
         val listenScale = when {
             interaction.interactionType == InteractionType.NavigationReturn -> 0.7
             isQuickSkip -> config.quickSkipListenScale
-            else -> progress * 0.55
+            else -> interaction.effectiveListeningProgress * 0.55
         }
         val genres = bump(decayedGenres, track.genres, listenScale, config.clamp)
         val artists = bump(decayedArtists, track.artists.map { it.id }, listenScale * 0.85, config.clamp)
@@ -113,6 +115,7 @@ data class SessionAffinityConfig(
     /** Skip aversions decay slower than positive session boosts. */
     val skipAversionDecay: Double = 0.94,
     val quickSkipProgress: Double = 0.12,
+    val quickSkipMinMs: Long = 8_000L,
     val quickSkipTrigger: Int = 2,
     val skipExplorationStep: Double = 0.18,
     val modeExplorationStep: Double = 0.08,

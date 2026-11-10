@@ -12,6 +12,7 @@ import com.sensorial.domain.model.TrackId
 import com.sensorial.domain.model.TrackInteraction
 import com.sensorial.domain.model.VerticalIntent
 import com.sensorial.domain.preference.PreferenceUpdateConfig
+import com.sensorial.domain.preference.QuickSkip
 import com.sensorial.domain.preference.UserPreferenceProfile
 import kotlin.math.abs
 import kotlin.math.min
@@ -37,6 +38,9 @@ data class RecommendationWeights(
     val popularityFit: Double = 0.35,
     val eraFit: Double = 0.25,
     val localSimilarity: Double = 0.4,
+    val transitionFit: Double = 0.45,
+    val deepenRelated: Double = 0.55,
+    val deepenSameArtist: Double = 0.7,
 ) {
     init {
         require(
@@ -45,6 +49,7 @@ data class RecommendationWeights(
                 listeningBehavior, contextualTime, similarity, artistDiversity,
                 trackRepetition, artistFocusRelief, negativePenalty, coldStart,
                 sessionAffinity, artistGraph, popularityFit, eraFit, localSimilarity,
+                transitionFit, deepenRelated, deepenSameArtist,
             ).all { it >= 0.0 },
         ) { "weights must be non-negative" }
     }
@@ -68,6 +73,9 @@ data class SignalScoringConfig(
     val coldStartCenterDance: Double = 0.5,
     val deepenSimilarityBoost: Double = 0.45,
     val exploreNoveltyBoost: Double = 0.45,
+    val transitionWindow: Int = 5,
+    val quickSkipProgress: Double = 0.12,
+    val quickSkipMinMs: Long = 8_000L,
 )
 
 data class RecommendationContext(
@@ -87,6 +95,8 @@ data class RecommendationContext(
     val prefetch: Boolean = false,
     /** Hard-block fingerprints (liked / well-heard works, including remasters). */
     val blockedFingerprints: Set<String> = emptySet(),
+    /** Optional weights from [ContextualWeightPolicy]; overrides presets when set. */
+    val weightOverride: RecommendationWeights? = null,
 )
 
 data class ScoreBreakdown(
@@ -104,10 +114,14 @@ data class ScoreBreakdown(
     val popularityFit: Double,
     val eraFit: Double,
     val localSimilarity: Double,
+    val transitionFit: Double = 0.0,
     val artistDiversity: Double,
     val trackRepetition: Double,
     val negative: Double,
     val coldStart: Double,
+    val deepenRelated: Double = 0.0,
+    val deepenSameArtist: Double = 0.0,
+    val diversity: Double = 0.0,
     val total: Double,
 )
 
@@ -126,7 +140,7 @@ fun interface RecommendationEngine {
 }
 
 /**
- * Explainable linear scoring engine. Weights and signal coeffs live in config types.
+ * Explainable linear scoring engine with calibrated signals and MMR selection.
  */
 class ScoredHeuristicRecommendationEngine(
     private val weights: RecommendationWeights = RecommendationWeights(),
@@ -136,6 +150,8 @@ class ScoredHeuristicRecommendationEngine(
     private val trackSimilarity: TrackSimilarity = LocalFeatureTrackSimilarity(),
     /** When true, ranking uses [RecommendationWeightsPresets] for the active discovery mode. */
     private val useModePresets: Boolean = false,
+    /** When true, [recommend]/[rank] reorder via [MmrSelector]. */
+    private val useMmr: Boolean = true,
 ) : RecommendationEngine {
 
     override fun recommend(
@@ -170,20 +186,31 @@ class ScoredHeuristicRecommendationEngine(
         }
         if (eligible.isEmpty()) return emptyList()
         val focus = ArtistFocusDetector.detect(context.recentInteractions, context.interactionTracks, diversity)
-        // Deepen already pulls toward the current climate; focus relief would trap on one artist.
         val focusedArtistId = if (context.discoveryMode == DiscoveryMode.Deepen) {
             null
         } else {
             focus.focusedArtistId
         }
-        val activeWeights = if (useModePresets) {
-            RecommendationWeightsPresets.forMode(context.discoveryMode)
-        } else {
-            weights
-        }
-        return eligible
+        val activeWeights = context.weightOverride
+            ?: if (useModePresets) {
+                RecommendationWeightsPresets.forMode(context.discoveryMode)
+            } else {
+                weights
+            }
+        val relevanceRanked = eligible
             .map { track -> scoreDetailed(track, userProfile, context, focusedArtistId, activeWeights) }
             .sortedByDescending { it.score }
+        if (!useMmr) return relevanceRanked
+        val seed = buildList {
+            context.currentTrack?.let { add(it) }
+            addAll(recentForDiversity.takeLast(4))
+        }.distinctBy { it.id }
+        return MmrSelector.selectSlate(
+            ranked = relevanceRanked,
+            seedSelected = seed,
+            mode = context.discoveryMode,
+            trackSimilarity = trackSimilarity,
+        )
     }
 
     fun score(
@@ -199,28 +226,38 @@ class ScoredHeuristicRecommendationEngine(
         focusedArtistId: ArtistId? = null,
         activeWeights: RecommendationWeights = weights,
     ): ScoredTrack {
-        val genreAffinity = track.genres.map { profile.genreScore(it) }.averageOrZero()
-        val artistAffinity = track.artists.map { profile.artistScore(it.id) }.averageOrZero()
-        val featureAffinity = featureAffinity(profile.preferredFeatures, track.audioFeatures) *
-            track.featureConfidence.coerceIn(0.25, 1.0)
-        val recent = recentGestureSignal(track, context)
-        val exploration = explorationAlignment(track, context, profile.explorationPreference) +
-            context.sessionAffinity.explorationBoost * 0.5
-        val listeningBehavior = track.genres.map { profile.genreListeningScore(it) }.averageOrZero() +
-            track.artists.map { profile.artistListeningScore(it.id) }.averageOrZero() * 0.5
-        val contextual = track.genres
-            .map {
-                profile.contextualGenreScore(
-                    it,
-                    context.localHour,
-                    context.dayOfWeek,
-                    preferenceConfig,
-                )
-            }
-            .averageOrZero()
-        val similarity = currentSimilarity(track, context.currentTrack)
-        val session = track.genres.map { context.sessionAffinity.genreBoost(it) }.averageOrZero() +
-            track.artists.map { context.sessionAffinity.artistBoost(it.id) }.averageOrZero() * 0.7
+        val genreAffinity = unitSigned(track.genres.map { profile.genreScore(it) }.averageOrZero())
+        val artistAffinity = unitSigned(track.artists.map { profile.artistScore(it.id) }.averageOrZero())
+        val featureAffinity = unit01(
+            featureAffinity(profile.preferredFeatures, track.audioFeatures) *
+                track.featureConfidence.coerceIn(0.25, 1.0),
+        )
+        val recent = unitSigned(recentGestureSignal(track, context))
+        val exploration = unit01(
+            explorationAlignment(track, context, profile.explorationPreference) +
+                context.sessionAffinity.explorationBoost * 0.5,
+        )
+        val listeningBehavior = unitSigned(
+            track.genres.map { profile.genreListeningScore(it) }.averageOrZero() +
+                track.artists.map { profile.artistListeningScore(it.id) }.averageOrZero() * 0.5,
+        )
+        val contextual = unitSigned(
+            track.genres
+                .map {
+                    profile.contextualGenreScore(
+                        it,
+                        context.localHour,
+                        context.dayOfWeek,
+                        preferenceConfig,
+                    )
+                }
+                .averageOrZero(),
+        )
+        val similarity = unit01(currentSimilarity(track, context.currentTrack))
+        val session = unitSigned(
+            track.genres.map { context.sessionAffinity.genreBoost(it) }.averageOrZero() +
+                track.artists.map { context.sessionAffinity.artistBoost(it.id) }.averageOrZero() * 0.7,
+        )
         val recentTracks = context.recentTracks.ifEmpty {
             context.recentInteractions.mapNotNull { context.interactionTracks[it.trackId] }
         }
@@ -233,72 +270,82 @@ class ScoredHeuristicRecommendationEngine(
         val sharesCurrentArtist = currentPrimary != null &&
             track.artists.any { it.id == currentPrimary }
         val isRelatedArtist = track.artists.any { it.id in context.relatedArtistIds }
-        val graph = artistGraphProximity(track, context, sameArtistStreak)
-        val popularity = popularityFit(track, context.discoveryMode)
-        val era = eraFit(track, recentTracks)
+        val graph = unitSigned(artistGraphProximity(track, context, sameArtistStreak))
+        val popularity = unit01(popularityFit(track, context.discoveryMode))
+        val era = unit01(eraFit(track, recentTracks))
         val localSimRaw = context.currentTrack?.let {
             trackSimilarity.similarity(track, it, emptyList()) *
                 track.featureConfidence.coerceIn(0.25, 1.0)
         } ?: 0.0
-        val localSim = when (context.discoveryMode) {
-            DiscoveryMode.Explore -> localSimRaw * 0.2
-            DiscoveryMode.Deepen -> localSimRaw
-            DiscoveryMode.Normal -> localSimRaw * 0.65
-        }
-        val artistPenalty = RecentArtistPenalty.score(
-            candidate = track,
-            recentTracks = recentTracks,
-            config = diversity,
-            focusedArtistId = focusedArtistId,
+        val localSim = unit01(
+            when (context.discoveryMode) {
+                DiscoveryMode.Explore -> localSimRaw * 0.2
+                DiscoveryMode.Deepen -> localSimRaw
+                DiscoveryMode.Normal -> localSimRaw * 0.65
+            },
         )
-        val trackPenalty = RecentTrackPenalty.score(
-            candidate = track,
-            recentTracks = recentTracks,
-            config = diversity,
+        val transition = unit01(transitionFit(track, recentTracks, context.currentTrack))
+        val artistPenalty = unit01(
+            RecentArtistPenalty.score(
+                candidate = track,
+                recentTracks = recentTracks,
+                config = diversity,
+                focusedArtistId = focusedArtistId,
+            ),
         )
-        val negative = negativePressure(genreAffinity, artistAffinity)
-        val cold = if (profile.isColdStart()) coldStartTieBreak(track) else 0.0
+        val trackPenalty = unit01(
+            RecentTrackPenalty.score(
+                candidate = track,
+                recentTracks = recentTracks,
+                config = diversity,
+            ),
+        )
+        val negative = unit01(negativePressure(genreAffinity, artistAffinity))
+        val cold = if (profile.isColdStart()) unit01(coldStartTieBreak(track)) else 0.0
 
         val deepenExtra = context.sessionAffinity.deepenStreak.coerceAtMost(3) * 0.08
         val exploreExtra = context.sessionAffinity.exploreStreak.coerceAtMost(3) * 0.08
-        // After repeating the same artist, soften Deepen's similarity pull so related can win.
         val deepenSimilarityScale = when {
             context.discoveryMode != DiscoveryMode.Deepen -> 1.0
             sameArtistStreak >= 3 && sharesCurrentArtist -> 0.35
             sameArtistStreak >= 2 && sharesCurrentArtist -> 0.55
             else -> 1.0
         }
-        val modeSimilarityBoost = when (context.discoveryMode) {
-            DiscoveryMode.Deepen ->
-                (signals.deepenSimilarityBoost + deepenExtra) * similarity * deepenSimilarityScale
-            DiscoveryMode.Explore -> -signals.exploreNoveltyBoost * similarity * 0.35
-            DiscoveryMode.Normal -> 0.0
-        }
-        val modeExplorationBoost = when (context.discoveryMode) {
-            DiscoveryMode.Explore -> (signals.exploreNoveltyBoost + exploreExtra) * (1.0 - similarity)
-            DiscoveryMode.Deepen -> if (sameArtistStreak >= 2) {
-                0.12 * (1.0 - similarity)
-            } else {
-                -0.15 * (1.0 - similarity)
-            }
-            DiscoveryMode.Normal -> context.sessionAffinity.explorationBoost * (1.0 - similarity) * 0.4
-        }
-        val deepenSameArtistPenalty = if (
+        val modeSimilarityBoost = unitSigned(
+            when (context.discoveryMode) {
+                DiscoveryMode.Deepen ->
+                    (signals.deepenSimilarityBoost + deepenExtra) * similarity * deepenSimilarityScale
+                DiscoveryMode.Explore -> -signals.exploreNoveltyBoost * similarity * 0.35
+                DiscoveryMode.Normal -> 0.0
+            },
+        )
+        val modeExplorationBoost = unitSigned(
+            when (context.discoveryMode) {
+                DiscoveryMode.Explore -> (signals.exploreNoveltyBoost + exploreExtra) * (1.0 - similarity)
+                DiscoveryMode.Deepen -> if (sameArtistStreak >= 2) {
+                    0.12 * (1.0 - similarity)
+                } else {
+                    -0.15 * (1.0 - similarity)
+                }
+                DiscoveryMode.Normal -> context.sessionAffinity.explorationBoost * (1.0 - similarity) * 0.4
+            },
+        )
+        val deepenSameArtistRaw = if (
             context.discoveryMode == DiscoveryMode.Deepen &&
             sharesCurrentArtist &&
             sameArtistStreak >= 2
         ) {
-            (sameArtistStreak - 1) * 0.7
+            ((sameArtistStreak - 1) * 0.35).coerceIn(0.0, 1.0)
         } else {
             0.0
         }
-        val deepenRelatedBoost = if (
+        val deepenRelatedRaw = if (
             context.discoveryMode == DiscoveryMode.Deepen &&
             isRelatedArtist &&
             !sharesCurrentArtist &&
             sameArtistStreak >= 2
         ) {
-            0.45 + (sameArtistStreak - 2).coerceAtMost(3) * 0.18
+            (0.55 + (sameArtistStreak - 2).coerceAtMost(3) * 0.15).coerceIn(0.0, 1.0)
         } else {
             0.0
         }
@@ -307,26 +354,29 @@ class ScoredHeuristicRecommendationEngine(
         val artist = activeWeights.artist * artistAffinity
         val features = activeWeights.features * featureAffinity
         val recentWeighted = activeWeights.recentSignals * recent
-        val explorationWeighted = activeWeights.exploration * (exploration + modeExplorationBoost)
+        val explorationWeighted = activeWeights.exploration * (exploration + modeExplorationBoost).coerceIn(-1.0, 1.5)
         val listeningBehaviorWeighted = activeWeights.listeningBehavior * listeningBehavior
         val contextualWeighted = activeWeights.contextualTime * contextual
-        val similarityWeighted = activeWeights.similarity * (similarity + modeSimilarityBoost)
+        val similarityWeighted = activeWeights.similarity * (similarity + modeSimilarityBoost).coerceIn(-1.0, 1.5)
         val sessionWeighted = activeWeights.sessionAffinity * session
         val graphWeighted = activeWeights.artistGraph * graph
         val popularityWeighted = activeWeights.popularityFit * popularity
         val eraWeighted = activeWeights.eraFit * era
         val localSimWeighted = activeWeights.localSimilarity * localSim
+        val transitionWeighted = activeWeights.transitionFit * transition
         val artistDivWeighted = activeWeights.artistDiversity * artistPenalty
         val trackRepWeighted = activeWeights.trackRepetition * trackPenalty
         val negativeWeighted = activeWeights.negativePenalty * negative
         val coldWeighted = activeWeights.coldStart * cold
+        val deepenRelatedWeighted = activeWeights.deepenRelated * deepenRelatedRaw
+        val deepenSameArtistWeighted = activeWeights.deepenSameArtist * deepenSameArtistRaw
 
         val total = genre + artist + features + recentWeighted + explorationWeighted +
             listeningBehaviorWeighted + contextualWeighted + similarityWeighted +
             sessionWeighted + graphWeighted + popularityWeighted + eraWeighted + localSimWeighted +
-            deepenRelatedBoost -
+            transitionWeighted + deepenRelatedWeighted -
             artistDivWeighted - trackRepWeighted - negativeWeighted + coldWeighted -
-            deepenSameArtistPenalty
+            deepenSameArtistWeighted
 
         return ScoredTrack(
             track = track,
@@ -346,13 +396,37 @@ class ScoredHeuristicRecommendationEngine(
                 popularityFit = popularityWeighted,
                 eraFit = eraWeighted,
                 localSimilarity = localSimWeighted,
+                transitionFit = transitionWeighted,
                 artistDiversity = -artistDivWeighted,
                 trackRepetition = -trackRepWeighted,
                 negative = -negativeWeighted,
                 coldStart = coldWeighted,
+                deepenRelated = deepenRelatedWeighted,
+                deepenSameArtist = -deepenSameArtistWeighted,
+                diversity = 0.0,
                 total = total,
             ),
         )
+    }
+
+    private fun transitionFit(
+        candidate: Track,
+        recentTracks: List<Track>,
+        current: Track?,
+    ): Double {
+        val window = buildList {
+            current?.let { add(it) }
+            addAll(recentTracks.asReversed())
+        }.distinctBy { it.id }.take(signals.transitionWindow)
+        if (window.isEmpty()) return 0.0
+        var weighted = 0.0
+        var weightSum = 0.0
+        window.forEachIndexed { index, track ->
+            val w = 1.0 / (1.0 + index)
+            weighted += w * trackAffinity(candidate, track)
+            weightSum += w
+        }
+        return if (weightSum == 0.0) 0.0 else (weighted / weightSum).coerceIn(0.0, 1.0)
     }
 
     private fun artistGraphProximity(
@@ -429,6 +503,13 @@ class ScoredHeuristicRecommendationEngine(
             val strength = signalStrength(interaction)
             val affinity = trackAffinity(candidate, interacted)
             val progress = interaction.effectiveListeningProgress
+            val duration = interaction.trackDurationMs ?: interacted.durationMs
+            val quickSkip = QuickSkip.isQuickSkip(
+                progress = progress,
+                trackDurationMs = duration,
+                baseProgress = signals.quickSkipProgress,
+                minListeningMs = signals.quickSkipMinMs,
+            )
 
             when (interaction.interactionType) {
                 InteractionType.ExplicitLike ->
@@ -438,8 +519,7 @@ class ScoredHeuristicRecommendationEngine(
                 InteractionType.ExplicitDislike ->
                     score -= signals.negativeRecentCoeff * affinity * strength * recency
                 InteractionType.NavigationAdvance, InteractionType.Discovery -> {
-                    if (progress <= 0.12) {
-                        // Quick skip: push away from similar tracks even after explorationBoost decays.
+                    if (quickSkip) {
                         score -= signals.negativeRecentCoeff * affinity * 0.85 * recency
                     } else {
                         score += (progress - 0.45) * 0.25 * affinity * recency
@@ -458,7 +538,7 @@ class ScoredHeuristicRecommendationEngine(
 
             val novelty = noveltyBetween(candidate, interacted)
             val proximity = 1.0 - novelty
-            if (progress <= 0.12 &&
+            if (quickSkip &&
                 interaction.interactionType in setOf(
                     InteractionType.NavigationAdvance,
                     InteractionType.Discovery,
@@ -470,7 +550,6 @@ class ScoredHeuristicRecommendationEngine(
                 DiscoveryMode.Deepen -> HorizontalIntent.Similar
                 DiscoveryMode.Explore -> HorizontalIntent.Explore
                 DiscoveryMode.Normal -> {
-                    // Ignore legacy horizontal noise on Normal navigation events.
                     if (interaction.horizontalIntent != HorizontalIntent.None &&
                         interaction.interactionType == InteractionType.Preference
                     ) {
@@ -580,4 +659,9 @@ class ScoredHeuristicRecommendationEngine(
             genreListeningScores.isEmpty()
 
     private fun List<Double>.averageOrZero(): Double = if (isEmpty()) 0.0 else average()
+
+    /** Clamp unbounded affinities roughly into [-1, 1]. */
+    private fun unitSigned(value: Double): Double = value.coerceIn(-1.0, 1.0)
+
+    private fun unit01(value: Double): Double = value.coerceIn(0.0, 1.0)
 }
